@@ -3,3 +3,5 @@ uvicorn
 aiogram
 google-genai
 pydantic
+httpx
+beautifulsoup4
