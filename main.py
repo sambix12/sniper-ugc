@@ -20,55 +20,25 @@ from google import genai
 from google.genai import types as genai_types
 
 # =====================================================================
-# КОНФИГУРАЦИЯ И ИНИЦИАЛИЗАЦИЯ
+# НАСТРОЙКИ И ИНИЦИАЛИЗАЦИЯ
 # =====================================================================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-APP_URL = os.getenv("RENDER_EXTERNAL_URL", "https://sniper-ugc.onrender.com")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+APP_URL = os.getenv("RENDER_EXTERNAL_URL", "https://sniper-ugc.onrender.com").strip()
 
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-# =====================================================================
-# МОДЕЛИ ДАННЫХ ДЛЯ ГЕНЕРАЦИИ И API
-# =====================================================================
 class AnalyzeRequest(BaseModel):
     query: str
-    format_type: str = "ugc"       # ugc, unboxing, problem_solution, aesthetic, storytelling
-    tone: str = "native"           # native, aggressive, humor, luxury
-
-class SceneItem(BaseModel):
-    timecode: str
-    visual: str
-    voiceover: str
-    on_screen_text: str
-    ai_video_prompt: str
-
-class ScriptVariant(BaseModel):
-    title: str
-    angle: str
-    virality_score: int
-    hook: str
-    scenes: List[SceneItem]
-    cta: str
-
-class UGCResponseSchema(BaseModel):
-    product_title: str
-    category: str
-    target_audience: str
-    pain_points: List[str]
-    killer_features: List[str]
-    viral_hooks: List[str]
-    scripts: List[ScriptVariant]
-    video_generator_prompts: List[str]
-    seo_caption: str
-    hashtags: List[str]
+    format_type: str = "ugc"
+    tone: str = "native"
 
 # =====================================================================
-# УНИВЕРСАЛЬНЫЙ ПАРСЕР (WILDBERRIES, OZON, ЛЮБЫЕ САЙТЫ И ТЕКСТ)
+# БЕЗОПАСНЫЙ СБОРЩИК ДАННЫХ (WILDBERRIES / ССЫЛКИ / ТЕКСТ)
 # =====================================================================
 def get_wb_basket_host(vol: int) -> str:
     ranges = [
@@ -84,7 +54,7 @@ def get_wb_basket_host(vol: int) -> str:
     return "https://basket-25.wbbasket.ru"
 
 
-async def parse_wildberries(nm_id: int, client: httpx.AsyncClient) -> dict:
+async def parse_wildberries_safe(nm_id: int, client: httpx.AsyncClient) -> dict:
     vol = nm_id // 100000
     part = nm_id // 1000
     host = get_wb_basket_host(vol)
@@ -93,7 +63,7 @@ async def parse_wildberries(nm_id: int, client: httpx.AsyncClient) -> dict:
     info = {
         "source": "Wildberries",
         "id": str(nm_id),
-        "title": f"Товар Wildberries #{nm_id}",
+        "title": f"Товар WB #{nm_id}",
         "brand": "",
         "description": "",
         "features": [],
@@ -101,540 +71,411 @@ async def parse_wildberries(nm_id: int, client: httpx.AsyncClient) -> dict:
         "image": f"{base_url}/images/big/1.webp"
     }
 
-    # 1. Запрос к внутреннему JSON карточки на CDN-корзине
     try:
-        r_card = await client.get(f"{base_url}/info/ru/card.json", timeout=8.0)
+        r_card = await client.get(f"{base_url}/info/ru/card.json", timeout=6.0)
         if r_card.status_code == 200:
             data = r_card.json()
             info["title"] = data.get("imt_name") or info["title"]
             info["brand"] = data.get("selling", {}).get("brand_name", "")
             info["description"] = data.get("description", "")
-            options = data.get("options", [])
-            info["features"] = [f"{opt.get('name')}: {opt.get('value')}" for opt in options[:12]]
+            opts = data.get("options", [])
+            info["features"] = [f"{o.get('name')}: {o.get('value')}" for o in opts[:10]]
     except Exception as e:
-        logging.warning(f"WB Basket JSON error: {e}")
+        logging.warning(f"WB card.json warning: {e}")
 
-    # 2. Запрос к API каталога для цены и рейтинга
     try:
         card_api = f"https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={nm_id}"
-        r_detail = await client.get(card_api, timeout=8.0)
+        r_detail = await client.get(card_api, timeout=6.0)
         if r_detail.status_code == 200:
-            products = r_detail.json().get("data", {}).get("products", [])
-            if products:
-                p = products[0]
-                if not info["title"] or "Товар Wildberries" in info["title"]:
+            prods = r_detail.json().get("data", {}).get("products", [])
+            if prods:
+                p = prods[0]
+                if not info["brand"]:
+                    info["brand"] = p.get("brand", "")
+                if "Товар WB" in info["title"]:
                     info["title"] = p.get("name", info["title"])
-                info["brand"] = info["brand"] or p.get("brand", "")
                 sizes = p.get("sizes", [])
                 if sizes and "price" in sizes[0]:
-                    price_rub = sizes[0]["price"].get("product", 0) // 100
-                    if price_rub:
-                        info["price"] = f"{price_rub} ₽"
+                    pr = sizes[0]["price"].get("product", 0) // 100
+                    if pr:
+                        info["price"] = f"{pr} ₽"
     except Exception as e:
-        logging.warning(f"WB Detail API error: {e}")
+        logging.warning(f"WB detail API warning: {e}")
 
     return info
 
 
-async def extract_universal_context(raw_input: str) -> dict:
-    raw_input = raw_input.strip()
+async def extract_product_data(raw_input: str) -> dict:
+    raw = raw_input.strip()
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8"
     }
 
-    async with httpx.AsyncClient(headers=headers, follow_redirects=True, verify=False) as client:
-        # Проверка на артикул или ссылку Wildberries
-        wb_match = re.search(r"wildberries\.ru/catalog/(\d+)", raw_input)
-        only_digits = re.fullmatch(r"\d{6,11}", raw_input)
+    # 1. Проверка Wildberries (по ссылке или по числовому артикулу)
+    wb_match = re.search(r"wildberries\.ru/catalog/(\d+)", raw)
+    num_match = re.fullmatch(r"\d{6,12}", raw)
+    if wb_match or num_match:
+        nm_id = int(wb_match.group(1) if wb_match else raw)
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True, verify=False) as client:
+            return await parse_wildberries_safe(nm_id, client)
 
-        if wb_match or only_digits:
-            nm_id = int(wb_match.group(1) if wb_match else raw_input)
-            return await parse_wildberries(nm_id, client)
-
-        # Проверка на URL любого другого сайта (Ozon, Яндекс Маркет, Shopify, лендинг, Telegram и т.д.)
-        url_match = re.search(r"(https?://[^\s]+)", raw_input)
-        if url_match:
-            url = url_match.group(1)
-            info = {
-                "source": "Web URL",
-                "url": url,
-                "title": "",
-                "description": "",
-                "features": [],
-                "image": "",
-                "raw_excerpt": ""
-            }
-            try:
-                resp = await client.get(url, timeout=12.0)
-                soup = BeautifulSoup(resp.text, "html.parser")
-
-                # Вытаскиваем OpenGraph и мета-теги
-                og_title = soup.find("meta", property="og:title")
-                og_desc = soup.find("meta", property="og:description")
-                og_img = soup.find("meta", property="og:image")
-                meta_desc = soup.find("meta", attrs={"name": "description"})
-
-                info["title"] = (
-                    (og_title["content"] if og_title and og_title.get("content") else "")
-                    or (soup.title.string.strip() if soup.title and soup.title.string else "")
-                )
-                info["description"] = (
-                    (og_desc["content"] if og_desc and og_desc.get("content") else "")
-                    or (meta_desc["content"] if meta_desc and meta_desc.get("content") else "")
-                )
-                info["image"] = og_img["content"] if og_img and og_img.get("content") else ""
-
-                # Вытаскиваем JSON-LD микроразметку продуктов, если есть
-                for script_tag in soup.find_all("script", type="application/ld+json"):
-                    try:
-                        ld_data = json.loads(script_tag.string or "{}")
-                        if isinstance(ld_data, dict):
-                            info["title"] = info["title"] or ld_data.get("name", "")
-                            info["description"] = info["description"] or ld_data.get("description", "")
-                    except Exception:
-                        pass
-
-                # Чистим видимый текст страницы
-                for junk in soup(["script", "style", "noscript", "svg", "footer", "nav"]):
-                    junk.decompose()
-                clean_text = " ".join(soup.stripped_strings)
-                info["raw_excerpt"] = clean_text[:3500]
-            except Exception as e:
-                logging.warning(f"Universal URL scrape fallback ({url}): {e}")
-                info["raw_excerpt"] = f"Ссылка пользователя: {url}. Доп. контекст из запроса: {raw_input}"
-
-            return info
-
-        # Если передан просто текст / описание ниши / идея
-        return {
-            "source": "Прямой запрос",
-            "title": raw_input[:90],
-            "description": raw_input,
+    # 2. Проверка веб-ссылки (Ozon, Яндекс Маркет, лендинги, интернет-магазины)
+    url_match = re.search(r"(https?://[^\s]+)", raw)
+    if url_match:
+        url = url_match.group(1)
+        fallback_data = {
+            "source": "Web Link",
+            "url": url,
+            "title": f"Продукт: {url}",
+            "description": "",
             "features": [],
-            "image": ""
+            "image": "",
+            "raw_text": f"Ссылка на товар: {url}\nПользовательский контекст: {raw}"
         }
+        try:
+            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=8.0, verify=False) as client:
+                resp = await client.get(url)
+                if resp.status_code == 200:
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    og_title = soup.find("meta", property="og:title")
+                    og_desc = soup.find("meta", property="og:description")
+                    og_img = soup.find("meta", property="og:image")
+
+                    if og_title and og_title.get("content"):
+                        fallback_data["title"] = og_title["content"].strip()
+                    elif soup.title and soup.title.string:
+                        fallback_data["title"] = soup.title.string.strip()
+
+                    if og_desc and og_desc.get("content"):
+                        fallback_data["description"] = og_desc["content"].strip()
+                    if og_img and og_img.get("content"):
+                        fallback_data["image"] = og_img["content"].strip()
+
+                    for tag in soup(["script", "style", "noscript", "svg", "nav", "footer"]):
+                        tag.decompose()
+                    clean = " ".join(soup.stripped_strings)
+                    fallback_data["raw_text"] += f"\nКонтент сайта: {clean[:2500]}"
+        except Exception as e:
+            logging.warning(f"URL parsing skipped due to: {e}")
+        return fallback_data
+
+    # 3. Прямой текстовый ввод
+    return {
+        "source": "Текст",
+        "title": raw[:80],
+        "description": raw,
+        "features": [],
+        "image": ""
+    }
 
 
 # =====================================================================
-# ГЕНЕРАЦИЯ ВИРАЛЬНОЙ СТРАТЕГИИ И СЦЕНАРИЕВ (GEMINI API)
+# ГЕНЕРАЦИЯ UGC-ВОРОНКИ ЧЕРЕЗ GEMINI
 # =====================================================================
-async def generate_ugc_pack(parsed_data: dict, format_type: str, tone: str) -> dict:
+async def generate_ugc_payload(data: dict, format_type: str, tone: str) -> dict:
     if not ai_client:
-        raise HTTPException(status_code=500, detail="Не задан GEMINI_API_KEY в переменных окружения Render.")
+        raise ValueError("GEMINI_API_KEY не задан в переменных окружения на Render. Добавь его во вкладке Environment.")
 
-    format_names = {
-        "ugc": "Нативный UGC-обзор от лица реального покупателя",
-        "unboxing": "ASMR / Быстрая распаковка + первая реакция",
-        "problem_solution": "Жесткая боль -> Решение через продукт",
-        "aesthetic": "Визуальный минимализм / Aesthetic TikTok / Reels",
-        "storytelling": "Личная мини-история с неожиданным твистом"
+    format_labels = {
+        "ugc": "Нативный честный отзыв реального пользователя",
+        "problem_solution": "Острая боль ЦА -> Спасение с помощью товара",
+        "unboxing": "Быстрая распаковка / ASMR / Эффект первого впечатления",
+        "aesthetic": "Эстетика / TikTok Lifestyle / Минималистичный визуал",
+        "storytelling": "Жизненная история / Провокация / Неожиданный финал"
     }
-    tone_names = {
-        "native": "Искренний, живой, разговорный ('делюсь находкой с другом')",
-        "aggressive": "Дерзкий, триггерный, максимальное удержание и провокация",
-        "humor": "Ироничный, с мемами и легким сарказмом",
-        "luxury": "Премиальный, лаконичный, фокус на статусе и эстетике"
+    tone_labels = {
+        "native": "Разговорный, нативный, доверительный",
+        "aggressive": "Дерзкий, кликбейтный, высокий темп, жесткие триггеры",
+        "humor": "Ирония, легкий стеб, житейский юмор",
+        "luxury": "Дорогой, спокойный, акцент на статусе и качестве"
     }
 
-    prompt = f"""
-Ты — топовый креативный продюсер TikTok, Instagram Reels и YouTube Shorts.
-Твоя задача — разработать полную виральную воронку и сценарии продвижения на основе входных данных о продукте/сервисе/ссылке.
+    system_instruction = """
+Ты — топ-продюсер вирального контента для TikTok, Reels и Shorts.
+Твоя задача — проанализировать товар/ссылку и сгенерировать готовую виральную воронку продвижения.
+Ты ВСЕГДА возвращаешь результат СТРОГО в виде валидного JSON без markdown-разметки (без ```json).
 
-ВХОДНЫЕ ДАННЫЕ О ПРОДУКТЕ / ССЫЛКЕ:
-{json.dumps(parsed_data, ensure_ascii=False, indent=2)}
-
-ВЫБРАННЫЙ ФОРМАТ: {format_names.get(format_type, format_type)}
-ТОНАЛЬНОСТЬ: {tone_names.get(tone, tone)}
-
-ТРЕБОВАНИЯ К РЕЗУЛЬТАТУ:
-1. Никакой воды и штампов ("В современном мире...", "Привет, друзья"). Только живой язык коротких роликов, удерживающий внимание с первой секунды.
-2. Сгенерируй 5 бронебойных хуков (первые 2 секунды видео), которые останавливают скролл ленты.
-3. Разработай 3 полноценных разноплановых сценария (с разными углами захода: например, через боль, через скепсис/проверку, через вау-эффект).
-4. В каждом сценарии распиши посекундную раскадровку:
-   - Таймкод (например, 0:00-0:02)
-   - Что конкретно в кадре (Visual)
-   - Озвучка (Voiceover — короткие динамичные фразы)
-   - Текст на экране (On-screen text)
-   - Промпт на английском языке для ИИ-видеогенератора (Kling AI / Runway Gen-3 / Sora) для генерации этого кадра (ai_video_prompt).
-5. Добавь 3 детальных мастер-промпта на английском языке для генерации полноценного B-roll видео с этим продуктом в нейросетях (Kling / Luma / Runway).
-6. Напиши продающее SEO-описание под ролик и подбери релевантные хэштеги.
+ФОРМАТ JSON:
+{
+  "product_title": "Название товара",
+  "category": "Категория",
+  "target_audience": "Кто покупает",
+  "pain_points": ["Боль 1", "Боль 2", "Боль 3"],
+  "killer_features": ["Фишка 1", "Фишка 2", "Фишка 3"],
+  "viral_hooks": [
+    "Хук 1 (первые 2 сек)",
+    "Хук 2",
+    "Хук 3",
+    "Хук 4",
+    "Хук 5"
+  ],
+  "scripts": [
+    {
+      "title": "Название сценария",
+      "angle": "Угол захода (например: Через разоблачение)",
+      "virality_score": 96,
+      "hook": "Текст хука",
+      "scenes": [
+        {
+          "timecode": "0:00-0:03",
+          "visual": "Что в кадре",
+          "voiceover": "Что говорится голосом",
+          "on_screen_text": "Текст на экране плашкой",
+          "ai_video_prompt": "Cinematic b-roll prompt in English for Kling or Runway"
+        }
+      ],
+      "cta": "Призыв к действию"
+    }
+  ],
+  "video_generator_prompts": [
+    "Prompt 1 for Kling/Runway (English)",
+    "Prompt 2 for Kling/Runway (English)",
+    "Prompt 3 for Kling/Runway (English)"
+  ],
+  "seo_caption": "Продающий текст под ролик",
+  "hashtags": ["#fyp", "#вайлдберриз"]
+}
 """
 
-    response = await asyncio.to_thread(
+    user_prompt = f"""
+ДАННЫЕ О ПРОДУКТЕ:
+{json.dumps(data, ensure_ascii=False, indent=2)}
+
+ФОРМАТ ВИДЕО: {format_labels.get(format_type, format_type)}
+ТОНАЛЬНОСТЬ: {tone_labels.get(tone, tone)}
+
+Сделай 3 детализированных сценария с раскадровкой, 5 хуков, 3 качественных промпта для ИИ-видео (Kling/Runway), выдели боли ЦА и SEO-описание.
+"""
+
+    resp = await asyncio.to_thread(
         ai_client.models.generate_content,
-        model="gemini-2.5-flash",
-        contents=prompt,
+        model="gemini-2.0-flash",
+        contents=user_prompt,
         config=genai_types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=UGCResponseSchema,
-            temperature=0.75,
-        ),
+            system_instruction=system_instruction,
+            temperature=0.7,
+            response_mime_type="application/json"
+        )
     )
 
-    result = json.loads(response.text)
-    result["meta_source"] = parsed_data.get("source", "Web")
-    result["meta_image"] = parsed_data.get("image", "")
-    result["meta_price"] = parsed_data.get("price", "")
-    result["meta_brand"] = parsed_data.get("brand", "")
-    return result
+    clean_json = resp.text.strip()
+    if clean_json.startswith("```"):
+        clean_json = re.sub(r"^```json\s*", "", clean_json)
+        clean_json = re.sub(r"^```\s*", "", clean_json)
+        clean_json = re.sub(r"\s*```$", "", clean_json)
+
+    parsed_result = json.loads(clean_json)
+    parsed_result["meta_source"] = data.get("source", "Web")
+    parsed_result["meta_image"] = data.get("image", "")
+    parsed_result["meta_price"] = data.get("price", "")
+    parsed_result["meta_brand"] = data.get("brand", "")
+    return parsed_result
 
 
 # =====================================================================
-# TELEGRAM-БОТ (ОБРАБОТКА ССЫЛОК В ЧАТЕ + КНОПКА MINI APP)
+# TELEGRAM BOT LOGIC
 # =====================================================================
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+async def bot_start(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚡ Открыть студию SNIPER UGC", web_app=WebAppInfo(url=APP_URL))]
+        [InlineKeyboardButton(text="⚡ Открыть SNIPER UGC", web_app=WebAppInfo(url=APP_URL))]
     ])
     await message.answer(
-        "<b>SNIPER UGC // AI GROWTH ENGINE</b>\n\n"
-        "Отправь любую ссылку (Wildberries, Ozon, сайт, Telegram-канал) или открой студию по кнопке ниже, "
-        "чтобы сгенерировать хуки, раскадровки и промпты для съёмки роликов.",
+        "<b>SNIPER // UGC GROWTH ENGINE</b>\n\n"
+        "Отправь артикул или ссылку на Wildberries / любой сайт, чтобы получить готовые сценарии и раскадровки, "
+        "или открой студию приложения по кнопке ниже:",
         reply_markup=kb,
         parse_mode="HTML"
     )
 
 @dp.message()
-async def handle_direct_message(message: types.Message):
-    text = (message.text or "").strip()
-    if not text:
+async def bot_quick_message(message: types.Message):
+    txt = (message.text or "").strip()
+    if not txt:
         return
-
-    status_msg = await message.answer("⏳ <b>Сканирую источник и собираю сценарии...</b>", parse_mode="HTML")
+    wait_msg = await message.answer("🔍 <b>Анализирую продукт и собираю воронку...</b>", parse_mode="HTML")
     try:
-        parsed = await extract_universal_context(text)
-        pack = await generate_ugc_pack(parsed, format_type="ugc", tone="native")
-
-        hooks_text = "\n".join([f"— {h}" for h in pack["viral_hooks"][:3]])
-        s1 = pack["scripts"][0]
-        scenes_text = "\n".join([
-            f"<code>[{sc['timecode']}]</code> <b>Кадр:</b> {sc['visual']}\n🗣 <i>«{sc['voiceover']}»</i>"
-            for sc in s1["scenes"]
-        ])
-
+        data = await extract_product_data(txt)
+        res = await generate_ugc_payload(data, "ugc", "native")
+        s1 = res["scripts"][0]
+        hooks = "\n".join([f"• <i>«{h}»</i>" for h in res["viral_hooks"][:3]])
+        
         reply = (
-            f"🎯 <b>{pack['product_title']}</b>\n"
-            f"ЦА: {pack['target_audience']}\n\n"
-            f"🔥 <b>ТОП-ХУКИ:</b>\n{hooks_text}\n\n"
-            f"🎬 <b>СЦЕНАРИЙ #1: {s1['title']} ({s1['virality_score']}% виральность)</b>\n"
-            f"{scenes_text}\n\n"
+            f"🎯 <b>{res['product_title']}</b>\n\n"
+            f"🔥 <b>ТОП-ХУКИ:</b>\n{hooks}\n\n"
+            f"🎬 <b>СЦЕНАРИЙ: {s1['title']} ({s1.get('virality_score', 95)}% виральность)</b>\n"
+            f"<b>Хук:</b> {s1['hook']}\n\n"
             f"📢 <b>CTA:</b> {s1['cta']}"
         )
-
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⚡ Открыть полный разбор в Mini App", web_app=WebAppInfo(url=APP_URL))]
+            [InlineKeyboardButton(text="⚡ Открыть полную раскадровку", web_app=WebAppInfo(url=APP_URL))]
         ])
-        await status_msg.edit_text(reply[:4000], reply_markup=kb, parse_mode="HTML")
+        await wait_msg.edit_text(reply, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
-        logging.error(f"Bot error: {e}")
-        await status_msg.edit_text(f"⚠️ Ошибка при разборе: {e}")
+        logging.error(f"Telegram parse err: {e}")
+        await wait_msg.edit_text(f"⚠️ Ошибка: {e}")
 
 
 # =====================================================================
-# ЖИЗНЕННЫЙ ЦИКЛ FASTAPI + ЗАПУСК POLLING БОТА
+# FASTAPI APP & HTML INTERFACE
 # =====================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    polling_task = None
+    task = None
     if bot:
         try:
             await bot.delete_webhook(drop_pending_updates=True)
-            polling_task = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
-            logging.info("Telegram Bot Polling запущен.")
+            task = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
+            logging.info("Bot Polling started.")
         except Exception as e:
-            logging.error(f"Не удалось запустить бота: {e}")
+            logging.error(f"Polling start failed: {e}")
     yield
-    if polling_task:
-        polling_task.cancel()
+    if task:
+        task.cancel()
     if bot:
         await bot.session.close()
 
-app = FastAPI(title="SNIPER UGC Engine", lifespan=lifespan)
+app = FastAPI(title="SNIPER UGC", lifespan=lifespan)
 
 @app.head("/")
-async def healthcheck_head():
+async def head_ping():
     return HTMLResponse(content="", status_code=200)
 
 @app.post("/api/analyze")
-async def api_analyze(req: AnalyzeRequest):
+async def api_analyze_endpoint(req: AnalyzeRequest):
     if not req.query or len(req.query.strip()) < 2:
-        raise HTTPException(status_code=400, detail="Введите ссылку, артикул или описание продукта.")
-    parsed = await extract_universal_context(req.query)
-    result = await generate_ugc_pack(parsed, req.format_type, req.tone)
-    return result
+        raise HTTPException(status_code=400, detail="Введите ссылку, артикул или описание товара")
+    try:
+        data = await extract_product_data(req.query)
+        result = await generate_ugc_payload(data, req.format_type, req.tone)
+        return result
+    except Exception as e:
+        logging.error(f"API Error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
-# =====================================================================
-# МИНИМАЛИСТИЧНЫЙ ЧЕРНО-БЕЛЫЙ ИНТЕРФЕЙС (HTML / CSS / JS)
-# =====================================================================
-FRONTEND_HTML = r"""<!DOCTYPE html>
+FRONTEND_UI = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>SNIPER // UGC</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="[https://telegram.org/js/telegram-web-app.js](https://telegram.org/js/telegram-web-app.js)"></script>
+<link href="[https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap](https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap)" rel="stylesheet">
 <style>
   :root {
     --bg: #000000;
     --surface: #0a0a0a;
-    --surface-hover: #121212;
     --border: #222222;
-    --border-active: #ffffff;
     --text: #ffffff;
     --text-muted: #888888;
-    --accent: #ffffff;
-    --accent-fg: #000000;
     --radius: 8px;
   }
-
-  * {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
-    -webkit-tap-highlight-color: transparent;
-  }
-
+  * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     background-color: var(--bg);
     color: var(--text);
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    font-family: 'Inter', sans-serif;
     font-size: 14px;
-    line-height: 1.5;
+    padding: 16px 16px 80px;
     min-height: 100vh;
-    padding: 16px 16px 60px;
-    overflow-x: hidden;
   }
-
-  .mono {
-    font-family: 'JetBrains Mono', monospace;
-  }
-
-  /* HEADER */
+  .mono { font-family: 'JetBrains Mono', monospace; }
   .header {
     display: flex;
-    align-items: center;
     justify-content: space-between;
-    padding-bottom: 16px;
-    margin-bottom: 20px;
+    align-items: center;
+    padding-bottom: 14px;
+    margin-bottom: 18px;
     border-bottom: 1px solid var(--border);
   }
-
-  .brand {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    font-weight: 700;
-    font-size: 16px;
-    letter-spacing: -0.03em;
-  }
-
-  .brand-dot {
-    width: 8px;
-    height: 8px;
-    background: var(--text);
-    border-radius: 50%;
-    box-shadow: 0 0 10px #fff;
-  }
-
-  .badge-status {
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    padding: 4px 8px;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    color: var(--text-muted);
-  }
-
-  /* INPUT PANEL */
+  .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 15px; }
+  .dot { width: 8px; height: 8px; background: #fff; border-radius: 50%; box-shadow: 0 0 8px #fff; }
+  .tag { font-size: 10px; border: 1px solid var(--border); padding: 3px 6px; border-radius: 4px; color: var(--text-muted); }
   .panel {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    padding: 16px;
+    padding: 14px;
     margin-bottom: 16px;
   }
-
-  .label {
-    display: block;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--text-muted);
-    margin-bottom: 8px;
-  }
-
-  .input-wrap {
-    position: relative;
-    margin-bottom: 14px;
-  }
-
-  textarea.main-input {
+  .lbl { font-size: 11px; color: var(--text-muted); text-transform: uppercase; margin-bottom: 8px; display: block; }
+  textarea.inp {
     width: 100%;
-    min-height: 76px;
-    background: #050505;
+    min-height: 72px;
+    background: #030303;
     border: 1px solid var(--border);
     border-radius: 6px;
-    color: var(--text);
+    color: #fff;
+    padding: 10px;
+    font-size: 13px;
     font-family: inherit;
-    font-size: 14px;
-    padding: 12px;
     resize: none;
     outline: none;
-    transition: border-color 0.15s ease;
+    margin-bottom: 12px;
   }
-
-  textarea.main-input:focus {
-    border-color: var(--border-active);
-  }
-
-  textarea.main-input::placeholder {
-    color: #555555;
-  }
-
-  /* CHIPS */
-  .chips-scroll {
-    display: flex;
-    gap: 6px;
-    overflow-x: auto;
-    padding-bottom: 4px;
-    margin-bottom: 14px;
-    scrollbar-width: none;
-  }
-  .chips-scroll::-webkit-scrollbar {
-    display: none;
-  }
-
+  textarea.inp:focus { border-color: #fff; }
+  .chips { display: flex; gap: 6px; overflow-x: auto; margin-bottom: 12px; scrollbar-width: none; }
+  .chips::-webkit-scrollbar { display: none; }
   .chip {
     flex-shrink: 0;
-    background: #050505;
+    background: #030303;
     color: var(--text-muted);
     border: 1px solid var(--border);
     border-radius: 4px;
     padding: 6px 10px;
-    font-size: 12px;
+    font-size: 11px;
     font-weight: 500;
     cursor: pointer;
-    transition: all 0.15s ease;
   }
-
-  .chip.active {
-    background: var(--text);
-    color: var(--bg);
-    border-color: var(--text);
-    font-weight: 600;
-  }
-
-  /* CTA BUTTON */
-  .btn-primary {
+  .chip.active { background: #fff; color: #000; border-color: #fff; font-weight: 600; }
+  .btn-submit {
     width: 100%;
-    background: var(--text);
-    color: var(--bg);
-    border: 1px solid var(--text);
-    border-radius: 6px;
-    padding: 13px 16px;
+    background: #fff;
+    color: #000;
+    border: none;
+    padding: 12px;
     font-size: 13px;
     font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 0.06em;
+    border-radius: 6px;
     cursor: pointer;
     display: flex;
-    align-items: center;
     justify-content: center;
+    align-items: center;
     gap: 8px;
-    transition: opacity 0.15s ease, transform 0.08s ease;
   }
-
-  .btn-primary:active {
-    transform: scale(0.99);
-  }
-
-  .btn-primary:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-  }
-
-  /* LOADER */
-  .loader-box {
+  .btn-submit:disabled { opacity: 0.4; cursor: not-allowed; }
+  .loader {
     display: none;
-    padding: 28px 16px;
-    text-align: center;
+    padding: 24px;
     border: 1px dashed var(--border);
     border-radius: var(--radius);
+    text-align: center;
     margin-bottom: 16px;
   }
-
   .spinner {
-    width: 24px;
-    height: 24px;
+    width: 22px;
+    height: 22px;
     border: 2px solid var(--border);
-    border-top-color: var(--text);
+    border-top-color: #fff;
     border-radius: 50%;
     animation: spin 0.7s linear infinite;
-    margin: 0 auto 12px;
+    margin: 0 auto 10px;
   }
-
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
-
-  .loader-step {
-    font-size: 12px;
-    color: var(--text-muted);
-  }
-
-  /* RESULTS */
-  #results {
-    display: none;
-  }
-
-  .product-summary {
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #results { display: none; }
+  .prod-head {
     display: flex;
     gap: 12px;
     align-items: center;
-    padding: 14px;
+    padding: 12px;
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     margin-bottom: 14px;
   }
-
-  .product-thumb {
-    width: 56px;
-    height: 56px;
-    border-radius: 6px;
-    object-fit: cover;
-    border: 1px solid var(--border);
-    background: #111;
-    flex-shrink: 0;
-  }
-
-  .product-meta h2 {
-    font-size: 15px;
-    font-weight: 600;
-    line-height: 1.3;
-    margin-bottom: 4px;
-  }
-
-  .meta-tags {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    font-size: 11px;
-    color: var(--text-muted);
-  }
-
-  .meta-tag {
-    border: 1px solid var(--border);
-    padding: 2px 6px;
-    border-radius: 4px;
-  }
-
-  /* TABS */
+  .prod-thumb { width: 50px; height: 50px; border-radius: 6px; object-fit: cover; background: #111; flex-shrink: 0; }
   .tabs {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
@@ -645,34 +486,20 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
     border-radius: var(--radius);
     margin-bottom: 14px;
   }
-
   .tab-btn {
     background: transparent;
     color: var(--text-muted);
     border: none;
-    padding: 8px 4px;
-    font-size: 11px;
+    padding: 8px 2px;
+    font-size: 10px;
     font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.04em;
     border-radius: 4px;
     cursor: pointer;
   }
-
-  .tab-btn.active {
-    background: var(--text);
-    color: var(--bg);
-  }
-
-  .tab-content {
-    display: none;
-  }
-
-  .tab-content.active {
-    display: block;
-  }
-
-  /* CARDS IN RESULTS */
+  .tab-btn.active { background: #fff; color: #000; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
   .card {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -680,183 +507,118 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
     padding: 14px;
     margin-bottom: 12px;
   }
-
-  .card-header {
+  .card-top {
     display: flex;
     justify-content: space-between;
-    align-items: flex-start;
-    gap: 8px;
+    align-items: center;
     margin-bottom: 10px;
-    padding-bottom: 8px;
+    padding-bottom: 6px;
     border-bottom: 1px solid var(--border);
   }
-
-  .card-title {
-    font-size: 13px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
-
   .copy-btn {
     background: transparent;
-    color: var(--text-muted);
     border: 1px solid var(--border);
-    border-radius: 4px;
+    color: var(--text-muted);
     padding: 3px 8px;
+    border-radius: 4px;
     font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
     cursor: pointer;
-    flex-shrink: 0;
   }
-
-  .copy-btn:active {
-    background: var(--text);
-    color: var(--bg);
-  }
-
+  .copy-btn:active { background: #fff; color: #000; }
   .hook-box {
-    background: #050505;
-    border-left: 2px solid var(--text);
-    padding: 10px 12px;
-    margin-bottom: 12px;
-    font-weight: 500;
+    background: #000;
+    border-left: 2px solid #fff;
+    padding: 8px 10px;
     font-size: 13px;
+    margin-bottom: 10px;
   }
-
-  .scene-row {
+  .scene-item {
+    background: #000;
     border: 1px solid var(--border);
     border-radius: 6px;
-    padding: 10px;
+    padding: 8px 10px;
     margin-bottom: 8px;
-    background: #050505;
+    font-size: 12px;
   }
-
-  .scene-top {
-    display: flex;
-    justify-content: space-between;
-    font-size: 11px;
-    color: var(--text-muted);
-    margin-bottom: 6px;
-  }
-
-  .scene-line {
-    margin-bottom: 5px;
-    font-size: 13px;
-  }
-
-  .scene-line strong {
-    color: var(--text-muted);
-    font-weight: 500;
-    font-size: 11px;
-    text-transform: uppercase;
-    margin-right: 4px;
-  }
-
-  .prompt-block {
+  .prompt-box {
     margin-top: 6px;
-    padding: 8px;
-    background: #0e0e0e;
-    border: 1px dashed #2a2a2a;
+    padding: 6px 8px;
+    background: #0a0a0a;
+    border: 1px dashed #222;
     border-radius: 4px;
     font-size: 11px;
-    color: #bbbbbb;
+    color: #aaa;
     display: flex;
     justify-content: space-between;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
   }
-
-  .list-item {
-    padding: 10px 12px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    margin-bottom: 8px;
-    background: #050505;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 10px;
-  }
-
   .toast {
     position: fixed;
     bottom: 20px;
     left: 50%;
     transform: translateX(-50%);
-    background: var(--text);
-    color: var(--bg);
-    padding: 8px 16px;
+    background: #fff;
+    color: #000;
+    padding: 6px 14px;
     border-radius: 4px;
     font-size: 11px;
     font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
     display: none;
-    z-index: 999;
+    z-index: 1000;
   }
 </style>
 </head>
 <body>
-
-  <header class="header">
-    <div class="brand">
-      <span class="brand-dot"></span>
-      <span>SNIPER // UGC</span>
-    </div>
-    <span class="badge-status mono">AI ENGINE v2.5</span>
-  </header>
-
-  <section class="panel">
-    <label class="label mono">01 / ИСТОЧНИК (ССЫЛКА ИЛИ ПРОДУКТ)</label>
-    <div class="input-wrap">
-      <textarea id="queryInput" class="main-input" placeholder="Вставь ссылку на Wildberries, Ozon, любой сайт, артикул товара или опиши идею словами..."></textarea>
-    </div>
-
-    <label class="label mono">02 / ФОРМАТ РОЛИКА</label>
-    <div class="chips-scroll" id="formatChips">
-      <button class="chip active" data-val="ugc">UGC Обзор</button>
-      <button class="chip" data-val="problem_solution">Боль → Решение</button>
-      <button class="chip" data-val="unboxing">Распаковка / ASMR</button>
-      <button class="chip" data-val="aesthetic">Aesthetic / Визуал</button>
-      <button class="chip" data-val="storytelling">Сторителлинг</button>
-    </div>
-
-    <label class="label mono">03 / ТОНАЛЬНОСТЬ ПОДАЧИ</label>
-    <div class="chips-scroll" id="toneChips">
-      <button class="chip active" data-val="native">Нативный (Дружеский)</button>
-      <button class="chip" data-val="aggressive">Дерзкий / Триггерный</button>
-      <button class="chip" data-val="humor">Юмор / Ирония</button>
-      <button class="chip" data-val="luxury">Минимализм / Люкс</button>
-    </div>
-
-    <button id="generateBtn" class="btn-primary mono" onclick="runAnalysis()">
-      <span>СГЕНЕРИРОВАТЬ СЦЕНАРИИ</span>
-      <span>→</span>
-    </button>
-  </section>
-
-  <div id="loader" class="loader-box">
-    <div class="spinner"></div>
-    <div id="loaderText" class="loader-step mono">СКАНИРУЮ ИСТОЧНИК И МЕТАДАННЫЕ...</div>
+  <div class="header">
+    <div class="brand"><div class="dot"></div><span>SNIPER // UGC</span></div>
+    <span class="tag mono">V2.0 STABLE</span>
   </div>
 
-  <section id="results">
-    <div class="product-summary" id="productHeader"></div>
+  <div class="panel">
+    <span class="lbl mono">Входной источник (Ссылка / Артикул / Описание)</span>
+    <textarea id="queryInp" class="inp" placeholder="Вставь ссылку на Wildberries, Ozon, любой сайт или артикул..."></textarea>
 
-    <div class="tabs mono">
-      <button class="tab-btn active" onclick="switchTab('scripts', this)">Сценарии</button>
-      <button class="tab-btn" onclick="switchTab('hooks', this)">Хуки</button>
-      <button class="tab-btn" onclick="switchTab('prompts', this)">AI Видео</button>
-      <button class="tab-btn" onclick="switchTab('strategy', this)">ЦА & SEO</button>
+    <span class="lbl mono">Формат ролика</span>
+    <div class="chips" id="fmtChips">
+      <button class="chip active" data-v="ugc">UGC Обзор</button>
+      <button class="chip" data-v="problem_solution">Боль → Решение</button>
+      <button class="chip" data-v="unboxing">Распаковка / ASMR</button>
+      <button class="chip" data-v="aesthetic">Aesthetic</button>
+      <button class="chip" data-v="storytelling">Сторителлинг</button>
     </div>
 
+    <span class="lbl mono">Тональность</span>
+    <div class="chips" id="toneChips">
+      <button class="chip active" data-v="native">Нативный</button>
+      <button class="chip" data-v="aggressive">Дерзкий / Триггер</button>
+      <button class="chip" data-v="humor">Юмор / Мем</button>
+      <button class="chip" data-v="luxury">Премиум / Люкс</button>
+    </div>
+
+    <button id="submitBtn" class="btn-submit mono" onclick="startGeneration()">
+      <span>СГЕНЕРИРОВАТЬ СЦЕНАРИИ</span> <span>→</span>
+    </button>
+  </div>
+
+  <div id="loader" class="loader">
+    <div class="spinner"></div>
+    <div id="loaderTxt" class="mono" style="font-size:11px; color:var(--text-muted);">ИЗВЛЕЧЕНИЕ ДАННЫХ И СЦЕНАРИЕВ...</div>
+  </div>
+
+  <div id="results">
+    <div class="prod-head" id="pHeader"></div>
+    <div class="tabs mono">
+      <button class="tab-btn active" onclick="setTab('scripts', this)">Сценарии</button>
+      <button class="tab-btn" onclick="setTab('hooks', this)">Хуки</button>
+      <button class="tab-btn" onclick="setTab('prompts', this)">AI Видео</button>
+      <button class="tab-btn" onclick="setTab('seo', this)">ЦА & SEO</button>
+    </div>
     <div id="tab-scripts" class="tab-content active"></div>
     <div id="tab-hooks" class="tab-content"></div>
     <div id="tab-prompts" class="tab-content"></div>
-    <div id="tab-strategy" class="tab-content"></div>
-  </section>
+    <div id="tab-seo" class="tab-content"></div>
+  </div>
 
   <div id="toast" class="toast mono">СКОПИРОВАНО</div>
 
@@ -869,217 +631,163 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
     if (tg.setBackgroundColor) tg.setBackgroundColor('#000000');
   }
 
-  let selectedFormat = 'ugc';
-  let selectedTone = 'native';
+  let curFmt = 'ugc';
+  let curTone = 'native';
 
-  function setupChips(containerId, callback) {
-    const container = document.getElementById(containerId);
-    container.querySelectorAll('.chip').forEach(btn => {
-      btn.addEventListener('click', () => {
-        container.querySelectorAll('.chip').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-        callback(btn.dataset.val);
-      });
+  function bindChips(id, cb) {
+    document.querySelectorAll('#' + id + ' .chip').forEach(c => {
+      c.onclick = () => {
+        document.querySelectorAll('#' + id + ' .chip').forEach(x => x.classList.remove('active'));
+        c.classList.add('active');
+        cb(c.dataset.v);
+      };
     });
   }
+  bindChips('fmtChips', v => curFmt = v);
+  bindChips('toneChips', v => curTone = v);
 
-  setupChips('formatChips', val => selectedFormat = val);
-  setupChips('toneChips', val => selectedTone = val);
-
-  function switchTab(tabName, btn) {
+  function setTab(name, btn) {
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
     document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
     btn.classList.add('active');
-    document.getElementById('tab-' + tabName).classList.add('active');
+    document.getElementById('tab-' + name).classList.add('active');
   }
 
-  function copyText(text) {
-    navigator.clipboard.writeText(text);
-    const toast = document.getElementById('toast');
-    toast.style.display = 'block';
+  function copy(txt) {
+    navigator.clipboard.writeText(txt);
+    const t = document.getElementById('toast');
+    t.style.display = 'block';
     if (tg?.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
-    setTimeout(() => { toast.style.display = 'none'; }, 1400);
+    setTimeout(() => t.style.display = 'none', 1200);
   }
 
-  function escapeHtml(str) {
-    if (!str) return '';
-    return String(str)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
+  function esc(s) {
+    if (!s) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
-  async function runAnalysis() {
-    const query = document.getElementById('queryInput').value.trim();
-    if (!query) {
-      alert('Вставь ссылку, артикул или описание продукта');
+  async function startGeneration() {
+    const q = document.getElementById('queryInp').value.trim();
+    if (!q) {
+      alert('Укажи ссылку или артикул');
       return;
     }
-
-    const btn = document.getElementById('generateBtn');
-    const loader = document.getElementById('loader');
-    const loaderText = document.getElementById('loaderText');
-    const results = document.getElementById('results');
+    const btn = document.getElementById('submitBtn');
+    const ldr = document.getElementById('loader');
+    const res = document.getElementById('results');
 
     btn.disabled = true;
-    results.style.display = 'none';
-    loader.style.display = 'block';
-
-    const steps = [
-      'ПАРСИНГ КАРТОЧКИ И МЕТАДАННЫХ...',
-      'ВЫЯВЛЕНИЕ БОЛЕЙ И ТРИГГЕРОВ ЦА...',
-      'СБОРКА ВИРАЛЬНЫХ ХУКОВ И РАСКАДРОВКИ...',
-      'ГЕНЕРАЦИЯ AI VIDEO PROMPTS...'
-    ];
-    let stepIdx = 0;
-    const stepTimer = setInterval(() => {
-      stepIdx = (stepIdx + 1) % steps.length;
-      loaderText.textContent = steps[stepIdx];
-    }, 2200);
+    res.style.display = 'none';
+    ldr.style.display = 'block';
 
     try {
       const resp = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          query: query,
-          format_type: selectedFormat,
-          tone: selectedTone
-        })
+        body: JSON.stringify({ query: q, format_type: curFmt, tone: curTone })
       });
 
+      const payload = await resp.json();
       if (!resp.ok) {
-        const errData = await resp.json().catch(() => ({}));
-        throw new Error(errData.detail || 'Ошибка сервера при генерации');
+        throw new Error(payload.detail || 'Не удалось обработать запрос');
       }
-
-      const data = await resp.json();
-      renderResults(data);
-      results.style.display = 'block';
+      render(payload);
+      res.style.display = 'block';
       if (tg?.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
-    } catch (err) {
-      alert('Ошибка: ' + err.message);
+    } catch (e) {
+      alert('Ошибка: ' + e.message);
     } finally {
-      clearInterval(stepTimer);
-      loader.style.display = 'none';
+      ldr.style.display = 'none';
       btn.disabled = false;
     }
   }
 
-  function renderResults(data) {
-    // 1. Шапка продукта
-    const imgHtml = data.meta_image
-      ? `<img class="product-thumb" src="${escapeHtml(data.meta_image)}" onerror="this.style.display='none'">`
-      : '';
-    const priceTag = data.meta_price ? `<span class="meta-tag mono">${escapeHtml(data.meta_price)}</span>` : '';
-    const sourceTag = `<span class="meta-tag mono">${escapeHtml(data.meta_source || 'WEB')}</span>`;
-    const catTag = `<span class="meta-tag mono">${escapeHtml(data.category)}</span>`;
-
-    document.getElementById('productHeader').innerHTML = `
+  function render(d) {
+    const imgHtml = d.meta_image ? `<img class="prod-thumb" src="${esc(d.meta_image)}" onerror="this.style.display='none'">` : '';
+    const price = d.meta_price ? `<span class="tag mono">${esc(d.meta_price)}</span>` : '';
+    document.getElementById('pHeader').innerHTML = `
       ${imgHtml}
-      <div class="product-meta">
-        <h2>${escapeHtml(data.product_title)}</h2>
-        <div class="meta-tags">${sourceTag}${catTag}${priceTag}</div>
+      <div>
+        <div style="font-weight:600; font-size:14px; margin-bottom:4px;">${esc(d.product_title)}</div>
+        <div style="display:flex; gap:6px;">
+          <span class="tag mono">${esc(d.meta_source || 'WEB')}</span>
+          <span class="tag mono">${esc(d.category || 'Товар')}</span>
+          ${price}
+        </div>
       </div>
     `;
 
-    // 2. Сценарии
-    const scriptsHtml = (data.scripts || []).map((sc, idx) => {
-      const fullScriptCopy = `СЦЕНАРИЙ: ${sc.title}\nХУК: ${sc.hook}\n\n` +
-        sc.scenes.map(s => `[${s.timecode}]\nКадр: ${s.visual}\nОзвучка: ${s.voiceover}\nТекст: ${s.on_screen_text}`).join('\n\n') +
-        `\n\nCTA: ${sc.cta}`;
-
-      const scenesList = (sc.scenes || []).map(s => `
-        <div class="scene-row">
-          <div class="scene-top mono">
-            <span>ТАЙМКОД: ${escapeHtml(s.timecode)}</span>
-            <span>SCENE</span>
-          </div>
-          <div class="scene-line"><strong>КАДР:</strong> ${escapeHtml(s.visual)}</div>
-          <div class="scene-line"><strong>ГОЛОС:</strong> «${escapeHtml(s.voiceover)}»</div>
-          <div class="scene-line"><strong>ТЕКСТ:</strong> ${escapeHtml(s.on_screen_text)}</div>
-          <div class="prompt-block mono">
-            <span>🎥 AI Prompt: ${escapeHtml(s.ai_video_prompt)}</span>
-            <button class="copy-btn" onclick='copyText(${JSON.stringify(s.ai_video_prompt)})'>COPY</button>
+    // 1. Сценарии
+    document.getElementById('tab-scripts').innerHTML = (d.scripts || []).map((sc, i) => {
+      const full = `Сценарий: ${sc.title}\nХук: ${sc.hook}\n` + (sc.scenes || []).map(s => `[${s.timecode}] ${s.visual} | Голос: ${s.voiceover}`).join('\n') + `\nCTA: ${sc.cta}`;
+      const scenes = (sc.scenes || []).map(s => `
+        <div class="scene-item">
+          <div class="mono" style="color:var(--text-muted); font-size:10px; margin-bottom:4px;">${esc(s.timecode)}</div>
+          <div><strong>Кадр:</strong> ${esc(s.visual)}</div>
+          <div style="margin:3px 0;"><strong>Голос:</strong> «${esc(s.voiceover)}»</div>
+          <div><strong>Текст:</strong> ${esc(s.on_screen_text)}</div>
+          <div class="prompt-box mono">
+            <span>AI: ${esc(s.ai_video_prompt)}</span>
+            <button class="copy-btn" onclick='copy(${JSON.stringify(s.ai_video_prompt)})'>COPY</button>
           </div>
         </div>
       `).join('');
 
       return `
         <div class="card">
-          <div class="card-header">
+          <div class="card-top">
             <div>
-              <div class="card-title">0${idx + 1} // ${escapeHtml(sc.title)}</div>
-              <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">
-                Угол: ${escapeHtml(sc.angle)} · Потенциал: <span class="mono" style="color:#fff">${sc.virality_score}%</span>
-              </div>
+              <div style="font-weight:700; text-transform:uppercase;">0${i+1} // ${esc(sc.title)}</div>
+              <div class="mono" style="font-size:10px; color:var(--text-muted);">${esc(sc.angle)} · ${sc.virality_score}% VIRALITY</div>
             </div>
-            <button class="copy-btn mono" onclick='copyText(${JSON.stringify(fullScriptCopy)})'>КОПИРОВАТЬ ВСЁ</button>
+            <button class="copy-btn mono" onclick='copy(${JSON.stringify(full)})'>ВЕСЬ СЦЕНАРИЙ</button>
           </div>
-          <div class="hook-box">
-            <span class="mono" style="font-size:10px; color:var(--text-muted); display:block; margin-bottom:2px;">ХУК (0-2 СЕК):</span>
-            «${escapeHtml(sc.hook)}»
-          </div>
-          ${scenesList}
-          <div class="scene-line" style="margin-top:10px; padding-top:8px; border-top:1px solid var(--border);">
-            <strong>ПРИЗЫВ (CTA):</strong> ${escapeHtml(sc.cta)}
-          </div>
+          <div class="hook-box"><strong>ХУК:</strong> «${esc(sc.hook)}»</div>
+          ${scenes}
+          <div style="font-size:12px; margin-top:8px;"><strong>CTA:</strong> ${esc(sc.cta)}</div>
         </div>
       `;
     }).join('');
-    document.getElementById('tab-scripts').innerHTML = scriptsHtml;
 
-    // 3. Хуки
-    const hooksHtml = (data.viral_hooks || []).map((h, i) => `
-      <div class="list-item">
-        <div>
-          <span class="mono" style="font-size:11px; color:var(--text-muted);">HOOK #0${i + 1}</span>
-          <div style="font-weight:500; margin-top:2px;">«${escapeHtml(h)}»</div>
+    // 2. Хуки
+    document.getElementById('tab-hooks').innerHTML = `
+      <div class="card">
+        ${(d.viral_hooks || []).map((h, i) => `
+          <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid var(--border);">
+            <div style="font-size:13px;"><strong>#0${i+1}</strong> «${esc(h)}»</div>
+            <button class="copy-btn mono" onclick='copy(${JSON.stringify(h)})'>COPY</button>
+          </div>
+        `).join('')}
+      </div>
+    `;
+
+    // 3. AI Видео
+    document.getElementById('tab-prompts').innerHTML = `
+      <div class="card">
+        ${(d.video_generator_prompts || []).map((p, i) => `
+          <div class="prompt-box mono" style="margin-bottom:8px;">
+            <span>${esc(p)}</span>
+            <button class="copy-btn" onclick='copy(${JSON.stringify(p)})'>COPY</button>
+          </div>
+        `).join('')}
+      </div>
+    `;
+
+    // 4. ЦА & SEO
+    const ht = (d.hashtags || []).join(' ');
+    const seoFull = `${d.seo_caption}\n\n${ht}`;
+    document.getElementById('tab-seo').innerHTML = `
+      <div class="card">
+        <div class="card-top"><strong>ЦЕЛЕВАЯ АУДИТОРИЯ</strong></div>
+        <div style="font-size:13px;">${esc(d.target_audience)}</div>
+      </div>
+      <div class="card">
+        <div class="card-top">
+          <strong>SEO ОПИСАНИЕ И ТЕГИ</strong>
+          <button class="copy-btn mono" onclick='copy(${JSON.stringify(seoFull)})'>COPY SEO</button>
         </div>
-        <button class="copy-btn mono" onclick='copyText(${JSON.stringify(h)})'>COPY</button>
-      </div>
-    `).join('');
-    document.getElementById('tab-hooks').innerHTML = `<div class="card"><div class="card-title" style="margin-bottom:12px;">ТРИГГЕРНЫЕ ХУКИ ДЛЯ ПЕРВЫХ 2 СЕКУНД</div>${hooksHtml}</div>`;
-
-    // 4. AI Видео промпты
-    const promptsHtml = (data.video_generator_prompts || []).map((p, i) => `
-      <div class="list-item">
-        <div class="mono" style="font-size:12px;">
-          <span style="color:var(--text-muted); display:block; margin-bottom:4px;">KLING / RUNWAY / SORA PROMPT #0${i + 1}</span>
-          ${escapeHtml(p)}
-        </div>
-        <button class="copy-btn mono" onclick='copyText(${JSON.stringify(p)})'>COPY</button>
-      </div>
-    `).join('');
-    document.getElementById('tab-prompts').innerHTML = `<div class="card"><div class="card-title" style="margin-bottom:12px;">ГОТОВЫЕ ПРОМПТЫ ДЛЯ ГЕНЕРАЦИИ B-ROLL</div>${promptsHtml}</div>`;
-
-    // 5. ЦА, Боли, Преимущества и SEO
-    const pains = (data.pain_points || []).map(p => `<li style="margin-bottom:6px; margin-left:16px;">${escapeHtml(p)}</li>`).join('');
-    const features = (data.killer_features || []).map(f => `<li style="margin-bottom:6px; margin-left:16px;">${escapeHtml(f)}</li>`).join('');
-    const hashtags = (data.hashtags || []).join(' ');
-    const fullSeo = `${data.seo_caption}\n\n${hashtags}`;
-
-    document.getElementById('tab-strategy').innerHTML = `
-      <div class="card">
-        <div class="card-header"><div class="card-title">ЦЕЛЕВАЯ АУДИТОРИЯ</div></div>
-        <p>${escapeHtml(data.target_audience)}</p>
-      </div>
-      <div class="card">
-        <div class="card-header"><div class="card-title">БОЛИ И ТРИГГЕРЫ ПОКУПАТЕЛЯ</div></div>
-        <ul>${pains}</ul>
-      </div>
-      <div class="card">
-        <div class="card-header"><div class="card-title">УБОЙНЫЕ ПРЕИМУЩЕСТВА (USP)</div></div>
-        <ul>${features}</ul>
-      </div>
-      <div class="card">
-        <div class="card-header">
-          <div class="card-title">SEO ОПИСАНИЕ И ХЭШТЕГИ</div>
-          <button class="copy-btn mono" onclick='copyText(${JSON.stringify(fullSeo)})'>COPY SEO</button>
-        </div>
-        <p style="margin-bottom:10px; white-space:pre-line;">${escapeHtml(data.seo_caption)}</p>
-        <div class="mono" style="font-size:12px; color:var(--text-muted);">${escapeHtml(hashtags)}</div>
+        <div style="font-size:13px; margin-bottom:8px; white-space:pre-line;">${esc(d.seo_caption)}</div>
+        <div class="mono" style="font-size:11px; color:var(--text-muted);">${esc(ht)}</div>
       </div>
     `;
   }
@@ -1090,7 +798,7 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_webapp():
-    return HTMLResponse(content=FRONTEND_HTML)
+    return HTMLResponse(content=FRONTEND_UI)
 
 
 if __name__ == "__main__":
