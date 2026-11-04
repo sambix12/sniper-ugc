@@ -21,6 +21,7 @@ from aiogram.types import (
     WebAppInfo,
     LabeledPrice,
     PreCheckoutQuery,
+    CallbackQuery,
 )
 
 from google import genai
@@ -34,9 +35,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 APP_URL = os.getenv("RENDER_EXTERNAL_URL", "https://sniper-ugc.onrender.com").strip()
-APP_URL_VERSIONED = APP_URL.rstrip("/") + "/?v=7"
+APP_URL_VERSIONED = APP_URL.rstrip("/") + "/?v=8"
 
-# Опционально можно добавить свой числовой Telegram ID в Render -> Environment -> ADMIN_TG_ID
 ADMIN_TG_ID = os.getenv("ADMIN_TG_ID", "").strip()
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
@@ -88,7 +88,7 @@ def discover_models_sync() -> list:
     for m in ai_client.models.list():
         name = (getattr(m, "name", "") or "").replace("models/", "")
         actions = getattr(m, "supported_actions", None) or []
-        if "flash" not in name or any(w in name for w in _BAD_WORDS):
+        if "flash" not in name or any(w in name for k in _BAD_WORDS for w in [k]):
             continue
         if actions and "generateContent" not in actions:
             continue
@@ -117,7 +117,7 @@ async def get_model_candidates() -> list:
 
 
 # =====================================================================
-# REQUEST SCHEMAS & PACKAGES
+# REQUEST SCHEMAS & PACKAGES (100 STARS / SCRIPT, 75 STARS / POST)
 # =====================================================================
 class PreviewRequest(BaseModel):
     query: str
@@ -127,6 +127,14 @@ class AnalyzeRequest(BaseModel):
     query: str
     format_type: str = "ugc"
     tone: str = "native"
+    lang: str = "ru"
+
+
+class RewriteScriptRequest(BaseModel):
+    product_title: str
+    script: dict
+    action: str = "shorter"   # shorter, longer, bolder, native, funny, custom
+    custom_instruction: str = ""
     lang: str = "ru"
 
 
@@ -143,29 +151,29 @@ class StarsInvoiceRequest(BaseModel):
 
 
 STAR_PACKS = {
-    "pack_50": {
-        "credits": 50,
-        "stars": 25,
-        "title_ru": "50 кредитов SNIPER UGC",
-        "title_en": "50 Credits SNIPER UGC",
-        "desc_ru": "Пакет на 5 генераций сценариев или 10 рекламных TG-постов",
-        "desc_en": "Pack for 5 video script funnels or 10 Telegram ad posts",
+    "pack_100": {
+        "credits": 100,
+        "stars": 100,
+        "title_ru": "100 ★ SNIPER UGC (1 сценарий)",
+        "title_en": "100 ★ SNIPER UGC (1 Script)",
+        "desc_ru": "Пополнение на 100 ★ (1 полный сценарий с суфлёром или TG-пост с остатком)",
+        "desc_en": "Top up 100 ★ (1 full script funnel or Telegram Ad Post)",
     },
-    "pack_150": {
-        "credits": 150,
-        "stars": 65,
-        "title_ru": "150 кредитов SNIPER UGC (Хит)",
-        "title_en": "150 Credits SNIPER UGC (Hot)",
-        "desc_ru": "Пакет на 15 генераций сценариев или 30 рекламных TG-постов",
-        "desc_en": "Pack for 15 video script funnels or 30 Telegram ad posts",
+    "pack_300": {
+        "credits": 300,
+        "stars": 300,
+        "title_ru": "300 ★ SNIPER UGC (Хит)",
+        "title_en": "300 ★ SNIPER UGC (Popular)",
+        "desc_ru": "Пакет на 3 полных сценария (по 100 ★) или 4 рекламных TG-поста (по 75 ★)",
+        "desc_en": "Pack for 3 full scripts (100 ★ each) or 4 Telegram Ad Posts (75 ★ each)",
     },
-    "pack_500": {
-        "credits": 500,
-        "stars": 190,
-        "title_ru": "500 кредитов SNIPER UGC PRO",
-        "title_en": "500 Credits SNIPER UGC PRO",
-        "desc_ru": "PRO-пакет для селлеров, блогеров и агентств",
-        "desc_en": "PRO pack for sellers, creators and agencies",
+    "pack_1000": {
+        "credits": 1000,
+        "stars": 850,
+        "title_ru": "1000 ★ SNIPER PRO (Выгода 15%)",
+        "title_en": "1000 ★ SNIPER PRO (Save 15%)",
+        "desc_ru": "PRO-пакет: 1000 ★ на баланс всего за 850 Telegram Stars",
+        "desc_en": "PRO pack: 1000 ★ balance for 850 Telegram Stars",
     },
 }
 
@@ -429,13 +437,12 @@ async def extract_product_data(raw_input: str) -> dict:
 
 
 # =====================================================================
-# GEMINI GENERATION (SCRIPTS + TG AD POSTS)
+# GEMINI GENERATION (SCRIPTS + REWRITE + TG AD POSTS)
 # =====================================================================
 SYSTEM_INSTRUCTION = """
-You are a top producer of viral short-form content for TikTok, Reels, Shorts, and Telegram Ad Posts.
-Analyze the product and produce a compact, high-converting promotion funnel.
+You are an elite creative producer of viral short-form content for TikTok, Reels, Shorts, and Telegram Ad Posts.
+Analyze the product and produce a high-converting promotion funnel.
 You ALWAYS reply with STRICTLY valid JSON, no markdown, no ```json fences.
-Keep every text field concise and punchy.
 
 JSON SCHEMA:
 {
@@ -449,7 +456,7 @@ JSON SCHEMA:
     {
       "title": "string",
       "angle": "string",
-      "virality_score": 95,
+      "virality_score": 96,
       "hook": "string",
       "scenes": [
         {
@@ -474,6 +481,32 @@ JSON SCHEMA:
   "video_generator_prompts": ["English prompt", "English prompt"],
   "seo_caption": "string (2 sentences max)",
   "hashtags": ["#tag", "#tag", "#tag", "#tag", "#tag"]
+}
+"""
+
+REWRITE_SYSTEM_INSTRUCTION = """
+You are an elite TikTok/Reels script doctor.
+Rewrite the provided script according to the user's modification command while keeping the same JSON structure.
+Reply STRICTLY with valid JSON representing the single updated script object, no markdown fences.
+
+JSON SCHEMA:
+{
+  "script": {
+    "title": "string",
+    "angle": "string",
+    "virality_score": 97,
+    "hook": "string",
+    "scenes": [
+      {
+        "timecode": "0:00-0:02",
+        "visual": "string",
+        "voiceover": "string",
+        "on_screen_text": "string",
+        "ai_video_prompt": "English cinematic prompt"
+      }
+    ],
+    "cta": "string"
+  }
 }
 """
 
@@ -508,6 +541,13 @@ TONE_LABELS = {
     "aggressive": "Bold, clickbait, fast pace, hard triggers",
     "humor": "Irony, light jokes, everyday humor",
     "luxury": "Premium, calm, focus on status and quality",
+}
+REWRITE_ACTIONS = {
+    "shorter": "Make the script 40% shorter, faster-paced, ultra-punchy, cut all fluff, maximum retention.",
+    "longer": "Make the script more detailed, add deeper storytelling, stronger arguments, and 4-5 rich scenes.",
+    "bolder": "Make the hook and voiceover much bolder, provocative, controversial, and scroll-stopping.",
+    "native": "Make the voiceover sound 100% like a casual voice message to a best friend, zero ad cliches.",
+    "funny": "Inject witty relatable humor, irony, and meme energy into the hook and voiceover.",
 }
 LANG_NAMES = {"ru": "Russian", "en": "English"}
 
@@ -545,7 +585,7 @@ async def _call_gemini_json(system_inst: str, user_prompt: str, require_key: str
 
     config = genai_types.GenerateContentConfig(
         system_instruction=system_inst,
-        temperature=0.78,
+        temperature=0.8,
         max_output_tokens=MAX_OUTPUT_TOKENS,
         response_mime_type="application/json"
     )
@@ -631,6 +671,24 @@ REQUIREMENTS:
     return parsed
 
 
+async def rewrite_single_script(req: RewriteScriptRequest) -> dict:
+    lang = req.lang if req.lang in LANG_NAMES else "ru"
+    instruction = req.custom_instruction.strip() if req.action == "custom" and req.custom_instruction.strip() else REWRITE_ACTIONS.get(req.action, REWRITE_ACTIONS["shorter"])
+    user_prompt = f"""
+PRODUCT: {req.product_title}
+CURRENT SCRIPT JSON:
+{json.dumps(req.script, ensure_ascii=False)}
+
+REWRITE INSTRUCTION:
+{instruction}
+
+OUTPUT LANGUAGE: {LANG_NAMES[lang]} (keep ai_video_prompt in English).
+Return the updated script object inside {{"script": ...}}.
+"""
+    parsed = await _call_gemini_json(REWRITE_SYSTEM_INSTRUCTION, user_prompt, require_key="script")
+    return parsed["script"]
+
+
 async def generate_tg_posts_only(data: dict, style: str, lang: str = "ru") -> dict:
     lang = lang if lang in LANG_NAMES else "ru"
     user_prompt = f"""
@@ -674,40 +732,88 @@ async def run_pipeline(query: str, format_type: str, tone: str, lang: str) -> di
 
 
 # =====================================================================
-# TELEGRAM BOT + TELEGRAM STARS PAYMENTS
+# TELEGRAM BOT (PREMIUM WELCOME + TELEGRAM STARS PAYMENTS)
 # =====================================================================
 BOT_TXT = {
     "ru": {
-        "start": "<b>SNIPER // UGC STUDIO</b>\n\nОтправь артикул или ссылку на Wildberries / Ozon / сайт, чтобы получить сценарии и рекламные посты, "
-                 "или открой обновлённую студию с телесуфлёром и маркировкой рекламы:",
-        "open": "⚡ Открыть SNIPER UGC Studio",
-        "wait": "🔍 <b>Сканирую карточку товара и собираю сценарии...</b>",
+        "start": (
+            "🎯 <b>SNIPER // UGC AI STUDIO 5.0</b>\n"
+            "<i>Премиальная платформа создания вирального контента для TikTok, Reels, Shorts и Telegram</i>\n\n"
+            "━━━━━━━━━━━━━━━\n"
+            "⚡ <b>ЧТО УМЕЕТ СТУДИЯ:</b>\n"
+            "• <b>Авто-парсинг в 1 клик:</b> Wildberries, Ozon и любые сайты — фото, бренд и цена подтягиваются мгновенно.\n"
+            "• <b>Виральные сценарии + Рерайт:</b> хуки, покадровый план, AI-промпты и умные кнопки <i>«Короче / Дерзко / Нативнее»</i>.\n"
+            "• <b>Встроенный Телесуфлёр:</b> читай текст прямо с экрана во время записи ролика.\n"
+            "• <b>TG-Посты + ОРД Маркировка:</b> готовые рекламные посты с токеном <code>erid</code> и водяным знаком на фото товара.\n"
+            "━━━━━━━━━━━━━━━\n"
+            "💎 <b>ТАРИФЫ:</b>\n"
+            "🎬 Полный разбор и сценарии — <b>100 ★</b>\n"
+            "📢 Пакет рекламных TG-постов — <b>75 ★</b>\n"
+            "🎁 Бонус новым авторам — <b>100 ★ на старте!</b>\n\n"
+            "👇 <b>Отправь ссылку/артикул прямо в чат или открой студию:</b>"
+        ),
+        "open": "🚀 Запустить SNIPER STUDIO",
+        "buy_100": "⭐ Купить 100 ★ (1 сценарий)",
+        "buy_300": "🔥 Купить 300 ★ (Хит)",
+        "how_btn": "💡 Как снимать с суфлёром",
+        "how_text": (
+            "🎬 <b>КАК СНИМАТЬ РОЛИКИ ЗА 2 МИНУТЫ:</b>\n\n"
+            "1️⃣ Вставь ссылку на товар с Wildberries / Ozon в студию.\n"
+            "2️⃣ Нажми <b>«Собрать сценарии»</b> — ИИ распишет хуки, кадры и озвучку.\n"
+            "3️⃣ Нужно динамичнее? Нажми кнопку <b>«✂️ Короче»</b> или <b>«🔥 Дерзко»</b> прямо под сценарием.\n"
+            "4️⃣ Нажми <b>«🎬 СУФЛЁР»</b>, поставь телефон перед собой и запиши видео с первого дубля!"
+        ),
+        "wait": "🔍 <b>Сканирую карточку товара и собираю виральную воронку...</b>",
         "hooks": "🔥 <b>ТОП-ХУКИ:</b>",
         "script": "🎬 <b>СЦЕНАРИЙ:",
         "viral": "виральность",
         "hook": "Хук:",
-        "full": "⚡ Открыть суфлёр и раскадровку",
+        "full": "⚡ Открыть рерайт и телесуфлёр",
         "err": "⚠️ Ошибка:",
-        "paid": "✅ <b>Оплата прошла успешно!</b>\nКредиты зачислены на твой баланс в приложении SNIPER UGC.",
+        "paid": "✅ <b>Оплата прошла успешно!</b>\nЗвёзды зачислены на твой баланс в приложении SNIPER UGC.",
     },
     "en": {
-        "start": "<b>SNIPER // UGC STUDIO</b>\n\nSend a Wildberries / Ozon / website link or SKU to get ready-to-shoot scripts, "
-                 "or open the studio with Teleprompter & Ad Post Builder:",
-        "open": "⚡ Open SNIPER UGC Studio",
+        "start": (
+            "🎯 <b>SNIPER // UGC AI STUDIO 5.0</b>\n"
+            "<i>Premium Viral Content & Ad Production Suite for TikTok, Reels, Shorts & Telegram</i>\n\n"
+            "━━━━━━━━━━━━━━━\n"
+            "⚡ <b>STUDIO FEATURES:</b>\n"
+            "• <b>1-Tap Product Parser:</b> Wildberries, Ozon & any web link with live product preview.\n"
+            "• <b>Viral Scripts + AI Rewrite:</b> scroll-stopping hooks, storyboards & instant 1-tap script restyling.\n"
+            "• <b>Fullscreen Teleprompter:</b> record videos in one take with eye-line guide & speed control.\n"
+            "• <b>Telegram Ad Builder:</b> native ad posts with ERID disclosure & photo watermarks.\n"
+            "━━━━━━━━━━━━━━━\n"
+            "💎 <b>PRICING:</b>\n"
+            "🎬 Full Script Funnel — <b>100 ★</b>\n"
+            "📢 Telegram Ad Post Pack — <b>75 ★</b>\n"
+            "🎁 Welcome Bonus — <b>100 ★ Free!</b>\n\n"
+            "👇 <b>Send a link/SKU right here or launch the studio:</b>"
+        ),
+        "open": "🚀 Launch SNIPER STUDIO",
+        "buy_100": "⭐ Top Up 100 ★ (1 Script)",
+        "buy_300": "🔥 Top Up 300 ★ (Popular)",
+        "how_btn": "💡 How it works",
+        "how_text": (
+            "🎬 <b>HOW TO SHOOT VIRAL VIDEOS IN 2 MINUTES:</b>\n\n"
+            "1️⃣ Paste any product link or SKU into the studio.\n"
+            "2️⃣ Generate hooks, storyboards, and voiceovers.\n"
+            "3️⃣ Use 1-tap AI Rewrite buttons (<i>Shorter / Bolder / Native</i>) to tune the script.\n"
+            "4️⃣ Tap <b>🎬 PROMPTER</b> and record your video in a single take!"
+        ),
         "wait": "🔍 <b>Scanning product and building viral funnel...</b>",
         "hooks": "🔥 <b>TOP HOOKS:</b>",
         "script": "🎬 <b>SCRIPT:",
         "viral": "virality",
         "hook": "Hook:",
-        "full": "⚡ Open Teleprompter & Storyboard",
+        "full": "⚡ Open AI Rewrite & Teleprompter",
         "err": "⚠️ Error:",
-        "paid": "✅ <b>Payment successful!</b>\nCredits have been added to your SNIPER UGC balance.",
+        "paid": "✅ <b>Payment successful!</b>\nStars have been added to your SNIPER UGC balance.",
     },
 }
 
 
-def user_lang(message: types.Message) -> str:
-    code = message.from_user.language_code if message.from_user else ""
+def user_lang(user_obj) -> str:
+    code = getattr(user_obj, "language_code", "") if user_obj else ""
     return norm_lang(code)
 
 
@@ -718,7 +824,7 @@ async def on_pre_checkout(pre_checkout_query: PreCheckoutQuery):
 
 @dp.message(F.successful_payment)
 async def on_successful_payment(message: types.Message):
-    L = BOT_TXT[user_lang(message)]
+    L = BOT_TXT[user_lang(message.from_user)]
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=L["open"], web_app=WebAppInfo(url=APP_URL_VERSIONED))]
     ])
@@ -727,11 +833,48 @@ async def on_successful_payment(message: types.Message):
 
 @dp.message(Command("start"))
 async def bot_start(message: types.Message):
-    L = BOT_TXT[user_lang(message)]
+    lang = user_lang(message.from_user)
+    L = BOT_TXT[lang]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=L["open"], web_app=WebAppInfo(url=APP_URL_VERSIONED))],
+        [
+            InlineKeyboardButton(text=L["buy_100"], callback_data="buy:pack_100"),
+            InlineKeyboardButton(text=L["buy_300"], callback_data="buy:pack_300"),
+        ],
+        [InlineKeyboardButton(text=L["how_btn"], callback_data="how_it_works")],
+    ])
+    await message.answer(L["start"], reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "how_it_works")
+async def cb_how_it_works(call: CallbackQuery):
+    lang = user_lang(call.from_user)
+    L = BOT_TXT[lang]
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=L["open"], web_app=WebAppInfo(url=APP_URL_VERSIONED))]
     ])
-    await message.answer(L["start"], reply_markup=kb, parse_mode="HTML")
+    await call.message.answer(L["how_text"], reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("buy:"))
+async def cb_buy_pack(call: CallbackQuery):
+    pack_id = call.data.split(":", 1)[1]
+    pack = STAR_PACKS.get(pack_id)
+    if not pack:
+        await call.answer("Пакет не найден", show_alert=True)
+        return
+    lang = user_lang(call.from_user)
+    uid = call.from_user.id if call.from_user else 0
+    await call.message.answer_invoice(
+        title=pack[f"title_{lang}"],
+        description=pack[f"desc_{lang}"],
+        payload=f"{pack_id}:{uid}:{pack['credits']}",
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(label=pack[f"title_{lang}"], amount=pack["stars"])],
+    )
+    await call.answer()
 
 
 @dp.message()
@@ -739,7 +882,7 @@ async def bot_quick_message(message: types.Message):
     txt = (message.text or "").strip()
     if not txt:
         return
-    lang = user_lang(message)
+    lang = user_lang(message.from_user)
     L = BOT_TXT[lang]
     wait_msg = await message.answer(L["wait"], parse_mode="HTML")
     try:
@@ -872,6 +1015,19 @@ async def api_analyze_endpoint(req: AnalyzeRequest):
         raise HTTPException(status_code=status, detail=error_text(e, lang))
 
 
+@app.post("/api/rewrite-script")
+async def api_rewrite_script_endpoint(req: RewriteScriptRequest):
+    lang = req.lang if req.lang in ERR else "en"
+    try:
+        updated = await rewrite_single_script(req)
+        return {"script": updated}
+    except Exception as e:
+        logging.error(f"Rewrite API error: {e}", exc_info=True)
+        code = classify(e)
+        status = 503 if code in ("busy", "quota", "timeout") else 500
+        raise HTTPException(status_code=status, detail=error_text(e, lang))
+
+
 @app.post("/api/tg-post")
 async def api_tg_post_endpoint(req: TgPostRequest):
     lang = req.lang if req.lang in ERR else "en"
@@ -911,229 +1067,284 @@ async def api_create_stars_invoice(req: StarsInvoiceRequest):
 
 
 # =====================================================================
-# FRONTEND UI (MODERN MOBILE STUDIO + DEVELOPER MODE + TELEPROMPTER)
+# FRONTEND UI (ULTRA-PREMIUM DESIGN + AI REWRITE + TELEPROMPTER)
 # =====================================================================
 FRONTEND_UI = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-<title>SNIPER // UGC STUDIO</title>
+<title>SNIPER // UGC STUDIO 5.0</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Unbounded:wght@500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Unbounded:wght@500;600;700;800&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #060609;
-    --surface: #0f0f15;
-    --surface2: #16161f;
-    --surface3: #1e1e2a;
+    --bg: #050508;
+    --surface: rgba(16, 16, 23, 0.78);
+    --surface-solid: #101017;
+    --surface2: #171722;
+    --surface3: #20202f;
     --border: rgba(255, 255, 255, 0.08);
-    --border-strong: rgba(212, 255, 58, 0.45);
-    --text: #f5f5f7;
-    --muted: #8b8b9c;
+    --border-highlight: rgba(255, 255, 255, 0.15);
+    --border-strong: rgba(212, 255, 58, 0.48);
+    --text: #f7f7fa;
+    --muted: #8e8ea0;
     --accent: #d4ff3a;
-    --accent-glow: rgba(212, 255, 58, 0.22);
-    --accent-ink: #08080a;
+    --accent2: #34d399;
+    --accent-glow: rgba(212, 255, 58, 0.25);
+    --accent-ink: #060608;
     --purple: #8b5cf6;
     --danger: #ff5c5c;
     --ok: #34d399;
-    --radius: 18px;
+    --radius: 20px;
     --font: 'Manrope', -apple-system, BlinkMacSystemFont, sans-serif;
     --display: 'Unbounded', 'Manrope', sans-serif;
     --mono: 'JetBrains Mono', monospace;
   }
 
   * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-  html, body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; line-height: 1.45; overflow-x: hidden; }
+  html, body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; line-height: 1.48; overflow-x: hidden; }
   body {
     min-height: 100vh;
-    background:
-      radial-gradient(650px 320px at 95% -5%, rgba(212, 255, 58, 0.09), transparent 60%),
-      radial-gradient(550px 320px at -10% 15%, rgba(139, 92, 246, 0.09), transparent 60%),
-      var(--bg);
+    background-color: var(--bg);
+    position: relative;
   }
 
-  .app { max-width: 520px; margin: 0 auto; padding: 14px 16px calc(105px + env(safe-area-inset-bottom)); }
+  /* AMBIENT FLOATING AURORA BACKGROUND */
+  body::before, body::after {
+    content: ""; position: fixed; pointer-events: none; z-index: 0; border-radius: 50%; filter: blur(95px); opacity: 0.45;
+    animation: auroraFloat 14s ease-in-out infinite alternate;
+  }
+  body::before {
+    width: 320px; height: 320px; top: -90px; right: -70px;
+    background: radial-gradient(circle, rgba(212, 255, 58, 0.28), transparent 70%);
+  }
+  body::after {
+    width: 300px; height: 300px; top: 28%; left: -110px;
+    background: radial-gradient(circle, rgba(139, 92, 246, 0.24), transparent 70%);
+    animation-delay: -7s;
+  }
+  @keyframes auroraFloat {
+    0% { transform: translate(0, 0) scale(1); }
+    100% { transform: translate(18px, 26px) scale(1.12); }
+  }
+
+  .app { position: relative; z-index: 1; max-width: 520px; margin: 0 auto; padding: 14px 16px calc(112px + env(safe-area-inset-bottom)); }
   .mono { font-family: var(--mono); }
   button { font-family: inherit; user-select: none; }
 
-  /* TOPBAR & DEVELOPER MODE BADGE */
+  /* TOPBAR */
   .topbar {
     display: flex; justify-content: space-between; align-items: center; gap: 8px;
     margin-bottom: 18px; padding: 6px 0;
   }
-  .brand { display: flex; align-items: center; gap: 8px; font-family: var(--display); font-weight: 700; font-size: 14px; letter-spacing: 0.4px; cursor: pointer; }
-  .brand .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 14px var(--accent); animation: pulseDot 2.4s infinite; }
-  @keyframes pulseDot { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.25); opacity: 0.75; } }
-  .brand .sub { color: var(--muted); font-weight: 500; font-size: 10.5px; background: var(--surface2); padding: 2px 7px; border-radius: 6px; border: 1px solid var(--border); }
+  .brand { display: flex; align-items: center; gap: 8px; font-family: var(--display); font-weight: 800; font-size: 14px; letter-spacing: 0.4px; cursor: pointer; }
+  .brand .dot {
+    width: 10px; height: 10px; border-radius: 50%; background: var(--accent);
+    box-shadow: 0 0 16px var(--accent), 0 0 6px #fff; animation: pulseDot 2.2s infinite;
+  }
+  @keyframes pulseDot { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.28); opacity: 0.75; } }
+  .brand .sub {
+    color: var(--muted); font-weight: 600; font-size: 10px;
+    background: rgba(255,255,255,0.04); padding: 3px 8px; border-radius: 999px; border: 1px solid var(--border);
+  }
 
   .dev-top-badge {
-    display: none;
-    align-items: center; gap: 4px;
+    display: none; align-items: center; gap: 4px;
     font-family: var(--mono); font-size: 9.5px; font-weight: 800; letter-spacing: 0.5px;
     color: #000; background: linear-gradient(135deg, #d4ff3a, #34d399);
-    padding: 3px 8px; border-radius: 6px;
-    box-shadow: 0 0 16px rgba(212, 255, 58, 0.45);
-    text-transform: uppercase;
+    padding: 3px 8px; border-radius: 999px;
+    box-shadow: 0 0 18px rgba(212, 255, 58, 0.5); text-transform: uppercase;
   }
   .dev-top-badge.active { display: inline-flex; }
 
   .top-actions { display: flex; align-items: center; gap: 8px; }
   .bal-chip {
     display: flex; align-items: center; gap: 6px;
-    background: linear-gradient(135deg, rgba(212,255,58,0.12), rgba(255,255,255,0.03));
-    border: 1px solid rgba(212,255,58,0.3); color: var(--text);
-    padding: 7px 12px; border-radius: 999px; font-weight: 800; font-size: 13px; cursor: pointer;
-    transition: transform 0.15s ease;
+    background: linear-gradient(135deg, rgba(212,255,58,0.16), rgba(255,255,255,0.04));
+    border: 1px solid rgba(212,255,58,0.38); color: var(--text);
+    padding: 7px 13px; border-radius: 999px; font-weight: 800; font-size: 13px; cursor: pointer;
+    box-shadow: 0 4px 15px rgba(212, 255, 58, 0.12);
+    transition: transform 0.15s cubic-bezier(0.2, 0.8, 0.2, 1);
   }
-  .bal-chip:active { transform: scale(0.95); }
-  .bal-chip .coin { color: var(--accent); }
-  .lang-sw { display: flex; background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: 3px; }
+  .bal-chip:active { transform: scale(0.93); }
+  .bal-chip .coin { color: var(--accent); font-size: 14px; }
+  .lang-sw { display: flex; background: var(--surface-solid); border: 1px solid var(--border); border-radius: 999px; padding: 3px; }
   .lang-sw button {
-    background: transparent; border: none; color: var(--muted); font-weight: 700; font-size: 11px;
+    background: transparent; border: none; color: var(--muted); font-weight: 800; font-size: 11px;
     padding: 5px 9px; border-radius: 999px; cursor: pointer; transition: all 0.2s ease;
   }
   .lang-sw button.active { background: var(--text); color: #000; }
 
-  /* DEVELOPER CONSOLE CARD IN CABINET */
-  .dev-console {
-    display: none;
-    background: linear-gradient(135deg, rgba(212, 255, 58, 0.12), rgba(52, 211, 153, 0.08)), #0b0b10;
-    border: 1.5px solid var(--accent);
-    border-radius: var(--radius);
-    padding: 15px; margin-bottom: 14px;
-    box-shadow: 0 0 28px rgba(212, 255, 58, 0.14);
+  /* HERO HEADER BANNER */
+  .hero-box {
+    position: relative; overflow: hidden;
+    background: linear-gradient(135deg, rgba(212,255,58,0.11) 0%, rgba(139,92,246,0.09) 100%), var(--surface);
+    border: 1px solid var(--border-highlight); border-radius: var(--radius);
+    padding: 16px; margin-bottom: 14px;
+    backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
   }
-  .dev-console.active { display: block; animation: viewEnter 0.25s ease; }
-  .dev-console-head {
-    display: flex; justify-content: space-between; align-items: center;
-    margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid rgba(212, 255, 58, 0.2);
+  .hero-kicker {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-family: var(--mono); font-size: 10px; font-weight: 700; color: var(--accent);
+    background: rgba(212,255,58,0.1); border: 1px solid rgba(212,255,58,0.28);
+    padding: 3px 9px; border-radius: 999px; margin-bottom: 8px; text-transform: uppercase;
   }
-  .dev-console-title {
-    font-family: var(--mono); font-size: 11.5px; font-weight: 800; color: var(--accent);
-    letter-spacing: 0.6px; display: flex; align-items: center; gap: 6px;
-  }
-  .dev-actions-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+  h1.title { font-family: var(--display); font-size: 18px; font-weight: 700; line-height: 1.25; margin-bottom: 5px; letter-spacing: -0.02em; }
+  p.lead { color: var(--muted); font-size: 12.5px; line-height: 1.45; }
 
-  /* VIEWS */
+  /* VIEWS & STAGGER ANIMATIONS */
   .view { display: none; }
-  .view.active { display: block; animation: viewEnter 0.3s cubic-bezier(0.16, 1, 0.3, 1); }
-  @keyframes viewEnter { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-
-  h1.title { font-family: var(--display); font-size: 19px; font-weight: 700; line-height: 1.25; margin-bottom: 6px; letter-spacing: -0.02em; }
-  p.lead { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .view.active { display: block; animation: viewEnter 0.35s cubic-bezier(0.16, 1, 0.3, 1); }
+  @keyframes viewEnter { from { opacity: 0; transform: translateY(12px) scale(0.99); } to { opacity: 1; transform: none; } }
 
   .panel, .card {
-    background: rgba(15, 15, 21, 0.85); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
-    border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 15px; margin-bottom: 14px;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+    background: var(--surface); backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px);
+    border: 1px solid var(--border); border-top-color: var(--border-highlight);
+    border-radius: var(--radius); padding: 16px; margin-bottom: 14px;
+    box-shadow: 0 14px 36px rgba(0, 0, 0, 0.38);
+    transition: border-color 0.25s ease, transform 0.2s ease;
   }
+  .stagger-card { animation: cardPop 0.4s cubic-bezier(0.16, 1, 0.3, 1) both; }
+  @keyframes cardPop { from { opacity: 0; transform: translateY(16px) scale(0.98); } to { opacity: 1; transform: none; } }
+
   .lbl { font-family: var(--mono); font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
 
-  /* SLEEK MOBILE SMART INPUT POD */
+  /* SMART INPUT CAPSULE */
   .smart-input-pod {
-    background: var(--bg);
-    border: 1.5px solid var(--border);
-    border-radius: 16px;
-    padding: 10px 12px;
-    margin-bottom: 12px;
-    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    background: rgba(6, 6, 10, 0.9);
+    border: 1.5px solid var(--border-highlight);
+    border-radius: 16px; padding: 10px 12px; margin-bottom: 12px;
+    transition: all 0.22s ease;
   }
   .smart-input-pod:focus-within {
     border-color: var(--accent);
-    box-shadow: 0 0 0 3px var(--accent-glow);
+    box-shadow: 0 0 0 4px rgba(212, 255, 58, 0.14);
   }
-  .smart-input-row { display: flex; align-items: center; gap: 8px; }
+  .smart-input-row { display: flex; align-items: center; gap: 9px; }
   .smart-icon {
-    width: 34px; height: 34px; border-radius: 10px;
-    background: var(--surface2); border: 1px solid var(--border);
+    width: 36px; height: 36px; border-radius: 11px;
+    background: linear-gradient(135deg, rgba(212,255,58,0.15), rgba(255,255,255,0.03));
+    border: 1px solid rgba(212,255,58,0.3);
     display: flex; align-items: center; justify-content: center;
     color: var(--accent); flex-shrink: 0; font-size: 16px;
   }
   .smart-field {
     flex: 1; min-width: 0; background: transparent; border: none; outline: none;
     color: var(--text); font-size: 14px; font-family: inherit; font-weight: 500;
-    line-height: 1.35; resize: none; max-height: 90px; overflow-y: auto;
+    line-height: 1.38; resize: none; max-height: 90px; overflow-y: auto;
   }
-  .smart-field::placeholder { color: #565666; font-weight: 400; }
+  .smart-field::placeholder { color: #565668; font-weight: 400; }
   .smart-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
   .paste-pill {
-    background: var(--surface2); color: var(--text); border: 1px solid var(--border);
-    padding: 6px 10px; border-radius: 10px; font-size: 11px; font-weight: 700;
+    background: var(--surface2); color: var(--text); border: 1px solid var(--border-highlight);
+    padding: 7px 11px; border-radius: 10px; font-size: 11px; font-weight: 800;
     cursor: pointer; display: flex; align-items: center; gap: 4px; transition: all 0.15s ease;
   }
-  .paste-pill:active { transform: scale(0.94); background: var(--accent); color: #000; }
+  .paste-pill:active { transform: scale(0.93); background: var(--accent); color: #000; }
   .clear-pill {
-    width: 26px; height: 26px; border-radius: 8px; background: var(--surface2);
+    width: 28px; height: 28px; border-radius: 9px; background: var(--surface2);
     color: var(--muted); border: 1px solid var(--border); display: none;
     align-items: center; justify-content: center; font-size: 12px; cursor: pointer;
   }
 
-  /* LIVE PRODUCT OVERVIEW PREVIEW CARD */
+  /* LIVE PRODUCT OVERVIEW CARD */
   .live-preview-wrap {
     display: none; margin-bottom: 14px;
-    background: linear-gradient(135deg, rgba(212, 255, 58, 0.08), rgba(139, 92, 246, 0.07)), var(--surface2);
-    border: 1px solid var(--border-strong); border-radius: 14px; padding: 11px 12px;
-    animation: slideDown 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+    background: linear-gradient(135deg, rgba(212, 255, 58, 0.1), rgba(52, 211, 153, 0.06)), var(--surface2);
+    border: 1px solid var(--border-strong); border-radius: 15px; padding: 11px 13px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+    animation: slideDown 0.28s cubic-bezier(0.16, 1, 0.3, 1);
   }
-  @keyframes slideDown { from { opacity: 0; transform: translateY(-8px) scale(0.98); } to { opacity: 1; transform: none; } }
+  @keyframes slideDown { from { opacity: 0; transform: translateY(-10px) scale(0.97); } to { opacity: 1; transform: none; } }
   .lp-inner { display: flex; align-items: center; gap: 12px; }
   .lp-thumb {
-    width: 54px; height: 54px; border-radius: 10px; object-fit: cover;
-    background: #0b0b0f; border: 1px solid var(--border); flex-shrink: 0;
+    width: 56px; height: 56px; border-radius: 12px; object-fit: cover;
+    background: #0b0b0f; border: 1px solid var(--border-highlight); flex-shrink: 0;
   }
   .lp-body { flex: 1; min-width: 0; }
   .lp-badges { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; flex-wrap: wrap; }
   .lp-badge {
-    font-family: var(--mono); font-size: 9.5px; font-weight: 700; text-transform: uppercase;
+    font-family: var(--mono); font-size: 9.5px; font-weight: 800; text-transform: uppercase;
     padding: 2px 7px; border-radius: 6px; background: var(--accent); color: #000;
   }
   .lp-price {
-    font-family: var(--mono); font-size: 10.5px; font-weight: 700;
-    padding: 2px 7px; border-radius: 6px; background: rgba(52, 211, 153, 0.16); color: var(--ok);
+    font-family: var(--mono); font-size: 10.5px; font-weight: 800;
+    padding: 2px 7px; border-radius: 6px; background: rgba(52, 211, 153, 0.18); color: var(--ok);
   }
-  .lp-title { font-weight: 700; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
+  .lp-title { font-weight: 800; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
   .lp-sub { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
 
-  /* CHIPS & BUTTONS */
+  /* CHIPS & SHIMMER CTA BUTTONS */
   .chips { display: flex; gap: 6px; overflow-x: auto; margin-bottom: 14px; scrollbar-width: none; padding-bottom: 2px; }
   .chips::-webkit-scrollbar { display: none; }
   .chip {
-    flex-shrink: 0; background: var(--bg); color: var(--muted); border: 1px solid var(--border);
-    border-radius: 999px; padding: 8px 13px; font-size: 12px; font-weight: 600; cursor: pointer;
-    transition: all 0.18s ease;
+    flex-shrink: 0; background: rgba(8, 8, 12, 0.85); color: var(--muted); border: 1px solid var(--border);
+    border-radius: 999px; padding: 8px 14px; font-size: 12px; font-weight: 700; cursor: pointer;
+    transition: all 0.2s cubic-bezier(0.2, 0.8, 0.2, 1);
   }
-  .chip.active { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); box-shadow: 0 4px 14px var(--accent-glow); }
+  .chip:active { transform: scale(0.94); }
+  .chip.active {
+    background: var(--accent); color: var(--accent-ink); border-color: var(--accent);
+    box-shadow: 0 4px 16px var(--accent-glow);
+  }
 
   .btn {
-    width: 100%; background: var(--accent); color: var(--accent-ink); border: none; padding: 14px 16px;
-    font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.4px;
-    border-radius: 14px; cursor: pointer; display: flex; justify-content: center; align-items: center; gap: 8px;
-    box-shadow: 0 6px 20px var(--accent-glow); transition: transform 0.12s ease, opacity 0.15s ease;
+    position: relative; overflow: hidden;
+    width: 100%; background: linear-gradient(135deg, #d4ff3a 0%, #b8f528 100%);
+    color: var(--accent-ink); border: none; padding: 15px 18px;
+    font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px;
+    border-radius: 15px; cursor: pointer; display: flex; justify-content: center; align-items: center; gap: 8px;
+    box-shadow: 0 8px 25px var(--accent-glow); transition: transform 0.14s ease, opacity 0.15s ease;
   }
-  .btn:active { transform: scale(0.98); }
+  .btn::after {
+    content: ""; position: absolute; top: 0; left: -120%; width: 65%; height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.45), transparent);
+    transform: skewX(-22deg); animation: btnShimmer 4.5s infinite;
+  }
+  @keyframes btnShimmer { 0%, 65% { left: -120%; } 100% { left: 160%; } }
+  .btn:active { transform: scale(0.975); }
   .btn:disabled { opacity: 0.45; cursor: not-allowed; box-shadow: none; }
-  .btn.ghost { background: var(--surface2); color: var(--text); border: 1px solid var(--border); box-shadow: none; }
-  .btn.small { width: auto; padding: 9px 14px; font-size: 11.5px; border-radius: 10px; box-shadow: none; }
-  .cost-note { text-align: center; color: var(--muted); font-size: 11px; margin-top: 9px; font-family: var(--mono); }
+  .btn.ghost { background: var(--surface2); color: var(--text); border: 1px solid var(--border-highlight); box-shadow: none; }
+  .btn.ghost::after { display: none; }
+  .btn.small { width: auto; padding: 9px 14px; font-size: 11.5px; border-radius: 11px; box-shadow: none; }
+  .cost-note { text-align: center; color: var(--muted); font-size: 11px; margin-top: 10px; font-family: var(--mono); }
 
-  .err-box {
-    display: none; background: rgba(255,92,92,0.1); border: 1px solid rgba(255,92,92,0.4); color: #ffb3b3;
-    border-radius: 14px; padding: 12px; margin-bottom: 14px; font-size: 13px;
+  /* AI REWRITE TOOLBAR INSIDE EACH SCRIPT CARD */
+  .rewrite-bar {
+    margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border-highlight);
   }
+  .rewrite-lbl {
+    font-family: var(--mono); font-size: 10px; color: var(--accent); text-transform: uppercase;
+    letter-spacing: 0.6px; margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between;
+  }
+  .rewrite-chips {
+    display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px;
+  }
+  .rw-chip {
+    background: var(--surface2); color: var(--text); border: 1px solid var(--border-highlight);
+    padding: 6px 11px; border-radius: 999px; font-size: 11px; font-weight: 700; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 4px; transition: all 0.16s ease;
+  }
+  .rw-chip:hover, .rw-chip:active {
+    background: var(--accent); color: #000; border-color: var(--accent); transform: translateY(-1px);
+  }
+  .rw-custom-box {
+    display: none; gap: 6px; margin-top: 8px; animation: slideDown 0.2s ease;
+  }
+  .rw-custom-box.open { display: flex; }
 
   /* AI LIVE TERMINAL LOADER */
   .ai-terminal {
-    display: none; background: #09090d; border: 1px solid var(--border-strong);
+    display: none; background: #08080c; border: 1px solid var(--border-strong);
     border-radius: var(--radius); padding: 16px; margin-bottom: 16px;
-    box-shadow: 0 12px 35px rgba(0, 0, 0, 0.5), 0 0 25px rgba(212, 255, 58, 0.08);
+    box-shadow: 0 14px 40px rgba(0, 0, 0, 0.55), 0 0 28px rgba(212, 255, 58, 0.1);
   }
   .term-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
   .term-dots { display: flex; gap: 6px; align-items: center; }
-  .term-dots span { width: 8px; height: 8px; border-radius: 50%; background: var(--border); }
+  .term-dots span { width: 8px; height: 8px; border-radius: 50%; }
   .term-dots span:nth-child(1) { background: #ff5f56; }
   .term-dots span:nth-child(2) { background: #ffbd2e; }
   .term-dots span:nth-child(3) { background: #27c93f; }
@@ -1145,136 +1356,138 @@ FRONTEND_UI = r"""<!DOCTYPE html>
     background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: 12px;
     padding: 12px; min-height: 118px; max-height: 180px; overflow-y: auto;
   }
-  .term-line { margin-bottom: 5px; display: flex; gap: 8px; align-items: flex-start; animation: fade 0.2s ease; }
+  .term-line { margin-bottom: 5px; display: flex; gap: 8px; align-items: flex-start; }
   .term-line .ok { color: var(--accent); flex-shrink: 0; }
   .term-cursor { display: inline-block; width: 7px; height: 13px; background: var(--accent); vertical-align: middle; margin-left: 4px; animation: blink 0.8s infinite; }
   @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 
   /* RESULTS */
   #results { display: none; }
-  .prod-head { display: flex; gap: 12px; align-items: center; padding: 13px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 14px; }
-  .prod-thumb { width: 58px; height: 58px; border-radius: 12px; object-fit: cover; background: #111; flex-shrink: 0; border: 1px solid var(--border); }
-  .tag { font-family: var(--mono); font-size: 10px; border: 1px solid var(--border); padding: 3px 8px; border-radius: 999px; color: var(--muted); background: var(--surface2); }
+  .prod-head { display: flex; gap: 12px; align-items: center; padding: 14px; background: var(--surface); border: 1px solid var(--border-highlight); border-radius: var(--radius); margin-bottom: 14px; }
+  .prod-thumb { width: 60px; height: 60px; border-radius: 14px; object-fit: cover; background: #111; flex-shrink: 0; border: 1px solid var(--border-highlight); }
+  .tag { font-family: var(--mono); font-size: 10px; border: 1px solid var(--border-highlight); padding: 3px 8px; border-radius: 999px; color: var(--muted); background: var(--surface2); }
 
   .tabs {
     display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none;
-    background: var(--surface); padding: 4px; border: 1px solid var(--border); border-radius: 14px; margin-bottom: 14px;
+    background: var(--surface-solid); padding: 5px; border: 1px solid var(--border-highlight); border-radius: 15px; margin-bottom: 14px;
   }
   .tabs::-webkit-scrollbar { display: none; }
   .tab-btn {
     flex: 1; white-space: nowrap; background: transparent; color: var(--muted); border: none;
-    padding: 9px 10px; font-size: 10.5px; font-weight: 800; text-transform: uppercase; border-radius: 10px; cursor: pointer;
-    transition: all 0.15s ease;
+    padding: 9px 10px; font-size: 10.5px; font-weight: 800; text-transform: uppercase; border-radius: 11px; cursor: pointer;
+    transition: all 0.18s ease;
   }
-  .tab-btn.active { background: var(--accent); color: #000; }
+  .tab-btn.active { background: var(--accent); color: #000; box-shadow: 0 3px 12px var(--accent-glow); }
   .tab-content { display: none; }
   .tab-content.active { display: block; animation: viewEnter 0.25s ease; }
 
   .card-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
   .action-row { display: flex; gap: 6px; align-items: center; }
   .copy-btn {
-    background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+    background: var(--surface2); border: 1px solid var(--border-highlight); color: var(--text);
     padding: 6px 10px; border-radius: 9px; font-size: 10.5px; font-weight: 700; cursor: pointer;
-    font-family: var(--mono); display: inline-flex; align-items: center; gap: 4px;
+    font-family: var(--mono); display: inline-flex; align-items: center; gap: 4px; transition: all 0.15s ease;
   }
-  .copy-btn:active { background: var(--accent); color: #000; }
+  .copy-btn:active { background: var(--accent); color: #000; transform: scale(0.95); }
   .prompter-btn {
     background: linear-gradient(135deg, var(--accent), #a3e635); color: #000; border: none;
-    padding: 6px 11px; border-radius: 9px; font-size: 10.5px; font-weight: 800; cursor: pointer;
+    padding: 6px 12px; border-radius: 9px; font-size: 10.5px; font-weight: 800; cursor: pointer;
     font-family: var(--mono); display: inline-flex; align-items: center; gap: 5px;
-    box-shadow: 0 3px 12px var(--accent-glow);
+    box-shadow: 0 3px 12px var(--accent-glow); transition: transform 0.15s ease;
   }
-  .prompter-btn:active { transform: scale(0.95); }
+  .prompter-btn:active { transform: scale(0.94); }
 
-  .hook-box { background: var(--bg); border-left: 3px solid var(--accent); padding: 10px 12px; font-size: 13px; margin-bottom: 10px; border-radius: 0 10px 10px 0; }
-  .scene-item { background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 11px 12px; margin-bottom: 8px; font-size: 12.5px; }
-  .prompt-box { margin-top: 8px; padding: 8px 10px; background: var(--surface); border: 1px dashed var(--border); border-radius: 10px; font-size: 11px; color: #b0b0bd; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .hook-box { background: rgba(5,5,8,0.85); border-left: 3px solid var(--accent); padding: 11px 13px; font-size: 13.5px; margin-bottom: 10px; border-radius: 0 12px 12px 0; }
+  .scene-item { background: rgba(5,5,8,0.8); border: 1px solid var(--border); border-radius: 13px; padding: 11px 13px; margin-bottom: 8px; font-size: 12.5px; }
+  .prompt-box { margin-top: 8px; padding: 8px 10px; background: var(--surface2); border: 1px dashed var(--border-highlight); border-radius: 10px; font-size: 11px; color: #b8b8c8; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 
   /* TG POST & ERID & WATERMARK STUDIO */
   .input-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
   input.inp {
-    width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 11px;
+    width: 100%; background: rgba(5,5,8,0.9); border: 1px solid var(--border-highlight); border-radius: 12px;
     color: var(--text); padding: 10px 12px; font-size: 13px; font-family: inherit; outline: none;
   }
   input.inp:focus { border-color: var(--accent); }
   .erid-preview {
-    background: rgba(139, 92, 246, 0.08); border: 1px dashed rgba(139, 92, 246, 0.45);
+    background: rgba(139, 92, 246, 0.1); border: 1px dashed rgba(139, 92, 246, 0.5);
     border-radius: 11px; padding: 9px 11px; font-size: 11.5px; color: #d8b4fe; margin-top: 8px;
     font-family: var(--mono);
   }
-  .tg-post-body { white-space: pre-line; font-size: 13.5px; line-height: 1.5; margin: 8px 0 10px; color: #ececf3; }
+  .tg-post-body { white-space: pre-line; font-size: 13.5px; line-height: 1.52; margin: 8px 0 10px; color: #ececf3; }
   .wm-canvas-wrap {
-    width: 100%; background: #050508; border: 1px solid var(--border); border-radius: 14px;
+    width: 100%; background: #050508; border: 1px solid var(--border-highlight); border-radius: 14px;
     overflow: hidden; margin: 10px 0; display: flex; align-items: center; justify-content: center; min-height: 220px;
   }
   canvas#wmCanvas { max-width: 100%; max-height: 340px; display: block; border-radius: 10px; }
 
-  /* FULLSCREEN TELEPROMPTER OVERLAY */
+  /* DEVELOPER CONSOLE CARD */
+  .dev-console {
+    display: none;
+    background: linear-gradient(135deg, rgba(212, 255, 58, 0.14), rgba(52, 211, 153, 0.08)), #0b0b10;
+    border: 1.5px solid var(--accent); border-radius: var(--radius);
+    padding: 15px; margin-bottom: 14px; box-shadow: 0 0 28px rgba(212, 255, 58, 0.16);
+  }
+  .dev-console.active { display: block; }
+  .dev-console-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid rgba(212, 255, 58, 0.2); }
+  .dev-console-title { font-family: var(--mono); font-size: 11.5px; font-weight: 800; color: var(--accent); letter-spacing: 0.6px; display: flex; align-items: center; gap: 6px; }
+  .dev-actions-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+
+  /* FULLSCREEN TELEPROMPTER */
   .teleprompter-modal {
     position: fixed; inset: 0; z-index: 500; background: #000000;
     display: none; flex-direction: column; justify-content: space-between;
     padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
   }
-  .teleprompter-modal.open { display: flex; animation: fade 0.2s ease; }
+  .teleprompter-modal.open { display: flex; animation: viewEnter 0.22s ease; }
   .tp-topbar {
     display: flex; justify-content: space-between; align-items: center;
-    padding: 12px 16px; background: rgba(15, 15, 21, 0.9); border-bottom: 1px solid var(--border); z-index: 5;
+    padding: 12px 16px; background: rgba(15, 15, 21, 0.92); border-bottom: 1px solid var(--border); z-index: 5;
   }
   .tp-title { font-family: var(--mono); font-size: 12px; color: var(--accent); font-weight: 700; display: flex; align-items: center; gap: 6px; }
-  .tp-stage {
-    position: relative; flex: 1; overflow-y: auto; padding: 38vh 22px 45vh;
-    scroll-behavior: auto;
-  }
+  .tp-stage { position: relative; flex: 1; overflow-y: auto; padding: 38vh 22px 45vh; scroll-behavior: auto; }
   .tp-stage.mirror { transform: scaleX(-1); }
   .tp-eye-guide {
-    position: fixed; top: 36%; left: 0; right: 0; height: 90px; pointer-events: none; z-index: 3;
-    border-top: 1.5px dashed rgba(212, 255, 58, 0.45);
-    border-bottom: 1.5px dashed rgba(212, 255, 58, 0.45);
+    position: fixed; top: 36%; left: 0; right: 0; height: 92px; pointer-events: none; z-index: 3;
+    border-top: 1.5px dashed rgba(212, 255, 58, 0.48);
+    border-bottom: 1.5px dashed rgba(212, 255, 58, 0.48);
     background: linear-gradient(90deg, rgba(212,255,58,0.06), transparent 15%, transparent 85%, rgba(212,255,58,0.06));
   }
   .tp-eye-tag {
     position: fixed; top: calc(36% - 18px); left: 16px; z-index: 4; pointer-events: none;
     font-family: var(--mono); font-size: 9px; color: var(--accent); text-transform: uppercase; letter-spacing: 1px;
   }
-  .tp-text {
-    font-size: 28px; font-weight: 800; line-height: 1.45; color: #ffffff;
-    text-align: center; outline: none; white-space: pre-wrap;
-  }
+  .tp-text { font-size: 28px; font-weight: 800; line-height: 1.45; color: #ffffff; text-align: center; outline: none; white-space: pre-wrap; }
   .tp-countdown {
-    position: fixed; inset: 0; z-index: 10; background: rgba(0,0,0,0.82);
+    position: fixed; inset: 0; z-index: 10; background: rgba(0,0,0,0.85);
     display: none; align-items: center; justify-content: center;
-    font-family: var(--display); font-size: 86px; font-weight: 700; color: var(--accent);
+    font-family: var(--display); font-size: 86px; font-weight: 800; color: var(--accent);
   }
-  .tp-controls {
-    background: rgba(15, 15, 21, 0.95); border-top: 1px solid var(--border);
-    padding: 12px 16px 16px; z-index: 5;
-  }
+  .tp-controls { background: rgba(15, 15, 21, 0.96); border-top: 1px solid var(--border); padding: 12px 16px 16px; z-index: 5; }
   .tp-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
-  .tp-row:last-child { margin-bottom: 0; }
   .tp-slider { flex: 1; accent-color: var(--accent); }
 
   /* CABINET & STARS */
   .profile { display: flex; align-items: center; gap: 12px; }
-  .avatar { width: 52px; height: 52px; border-radius: 50%; background: var(--surface2); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; font-family: var(--display); font-size: 18px; font-weight: 700; color: var(--accent); overflow: hidden; flex-shrink: 0; }
+  .avatar { width: 54px; height: 54px; border-radius: 50%; background: var(--surface2); border: 1.5px solid var(--border-strong); display: flex; align-items: center; justify-content: center; font-family: var(--display); font-size: 18px; font-weight: 700; color: var(--accent); overflow: hidden; flex-shrink: 0; }
   .avatar img { width: 100%; height: 100%; object-fit: cover; }
   .balance-card {
-    background: linear-gradient(135deg, rgba(212,255,58,0.15), rgba(139,92,246,0.12)), var(--surface);
-    border: 1px solid var(--border-strong); border-radius: 20px; padding: 18px; margin-bottom: 14px;
+    background: linear-gradient(135deg, rgba(212,255,58,0.16), rgba(139,92,246,0.14)), var(--surface);
+    border: 1px solid var(--border-strong); border-radius: 22px; padding: 18px; margin-bottom: 14px;
   }
-  .bal-num { font-family: var(--display); font-size: 36px; font-weight: 700; line-height: 1.1; margin: 6px 0 2px; }
+  .bal-num { font-family: var(--display); font-size: 36px; font-weight: 800; line-height: 1.1; margin: 6px 0 2px; color: var(--accent); }
   .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
-  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 12px; }
-  .stat .v { font-family: var(--display); font-size: 20px; font-weight: 600; }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 13px; }
+  .stat .v { font-family: var(--display); font-size: 20px; font-weight: 700; }
   .stat .k { color: var(--muted); font-size: 11px; margin-top: 2px; }
-  .sec-title { font-family: var(--display); font-size: 13px; font-weight: 600; margin: 18px 0 10px; }
+  .sec-title { font-family: var(--display); font-size: 13px; font-weight: 700; margin: 18px 0 10px; }
   .packs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 14px; }
-  .pack { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 13px 8px; text-align: center; cursor: pointer; position: relative; color: var(--text); transition: transform 0.15s ease; }
-  .pack:active { transform: scale(0.96); }
-  .pack.pop { border-color: var(--accent); background: linear-gradient(180deg, rgba(212,255,58,0.08), var(--surface)); }
-  .pack .pc { font-family: var(--display); font-size: 19px; font-weight: 700; }
+  .pack { background: var(--surface); border: 1px solid var(--border-highlight); border-radius: 16px; padding: 14px 8px; text-align: center; cursor: pointer; position: relative; color: var(--text); transition: transform 0.15s ease; }
+  .pack:active { transform: scale(0.95); }
+  .pack.pop { border-color: var(--accent); background: linear-gradient(180deg, rgba(212,255,58,0.12), var(--surface)); box-shadow: 0 6px 20px rgba(212,255,58,0.12); }
+  .pack .pc { font-family: var(--display); font-size: 18px; font-weight: 800; }
   .pack .pk { color: var(--muted); font-size: 10px; margin-bottom: 8px; }
-  .pack .pp { font-weight: 800; font-size: 13px; color: var(--accent); }
-  .pack .badge { position: absolute; top: -8px; left: 50%; transform: translateX(-50%); background: var(--accent); color: #000; font-size: 9px; font-weight: 800; padding: 2px 7px; border-radius: 999px; text-transform: uppercase; }
+  .pack .pp { font-weight: 800; font-size: 12.5px; color: var(--accent); }
+  .pack .badge { position: absolute; top: -8px; left: 50%; transform: translateX(-50%); background: var(--accent); color: #000; font-size: 9px; font-weight: 800; padding: 2px 8px; border-radius: 999px; text-transform: uppercase; }
   .list-item { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--border); }
   .list-item:last-child { border-bottom: none; }
   .li-main { min-width: 0; }
@@ -1283,36 +1496,43 @@ FRONTEND_UI = r"""<!DOCTYPE html>
   .plus { color: var(--ok); font-weight: 800; }
   .minus { color: var(--danger); font-weight: 800; }
   .empty { color: var(--muted); font-size: 12px; text-align: center; padding: 14px 0; }
+  .err-box { display: none; background: rgba(255,92,92,0.12); border: 1px solid rgba(255,92,92,0.4); color: #ffb3b3; border-radius: 14px; padding: 12px; margin-bottom: 14px; font-size: 13px; }
 
-  /* BOTTOM NAV (3 TABS) */
+  /* FLOATING GLASS BOTTOM NAV */
   .nav {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
-    padding: 8px 14px calc(8px + env(safe-area-inset-bottom));
-    background: rgba(6, 6, 9, 0.9); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
-    border-top: 1px solid var(--border);
+    padding: 8px 14px calc(10px + env(safe-area-inset-bottom));
+    background: linear-gradient(180deg, rgba(5,5,8,0) 0%, rgba(5,5,8,0.92) 35%);
+    pointer-events: none;
   }
-  .nav-inner { max-width: 520px; margin: 0 auto; display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .nav-inner {
+    pointer-events: auto;
+    max-width: 500px; margin: 0 auto; display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;
+    background: rgba(18, 18, 26, 0.88); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+    border: 1px solid var(--border-highlight); border-radius: 20px; padding: 6px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+  }
   .nav button {
-    background: transparent; border: none; color: var(--muted); display: flex; flex-direction: column; align-items: center; gap: 4px;
-    font-size: 10.5px; font-weight: 700; padding: 6px; border-radius: 12px; cursor: pointer; transition: color 0.15s ease;
+    background: transparent; border: none; color: var(--muted); display: flex; flex-direction: column; align-items: center; gap: 3px;
+    font-size: 10.5px; font-weight: 800; padding: 7px 4px; border-radius: 14px; cursor: pointer; transition: all 0.2s ease;
   }
-  .nav button.active { color: var(--accent); }
-  .nav svg { width: 21px; height: 21px; stroke: currentColor; fill: none; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+  .nav button.active { color: #000; background: var(--accent); box-shadow: 0 4px 14px var(--accent-glow); }
+  .nav svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 
   /* SHEET MODAL */
-  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.68); backdrop-filter: blur(5px); z-index: 100; display: none; align-items: flex-end; justify-content: center; }
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.72); backdrop-filter: blur(6px); z-index: 100; display: none; align-items: flex-end; justify-content: center; }
   .overlay.open { display: flex; }
-  .sheet { width: 100%; max-width: 520px; background: var(--surface); border: 1px solid var(--border); border-radius: 22px 22px 0 0; padding: 20px 18px calc(22px + env(safe-area-inset-bottom)); animation: up 0.22s ease; }
-  @keyframes up { from { transform: translateY(30px); opacity: 0; } to { transform: none; opacity: 1; } }
-  .sheet h3 { font-family: var(--display); font-size: 16px; font-weight: 600; margin-bottom: 12px; }
-  .sheet .kv { display: flex; justify-content: space-between; padding: 9px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .sheet { width: 100%; max-width: 520px; background: var(--surface-solid); border: 1px solid var(--border-highlight); border-radius: 24px 24px 0 0; padding: 22px 18px calc(24px + env(safe-area-inset-bottom)); animation: up 0.24s cubic-bezier(0.16, 1, 0.3, 1); }
+  @keyframes up { from { transform: translateY(40px); opacity: 0; } to { transform: none; opacity: 1; } }
+  .sheet h3 { font-family: var(--display); font-size: 16px; font-weight: 700; margin-bottom: 12px; }
+  .sheet .kv { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
   .sheet p { color: var(--muted); font-size: 12px; margin: 10px 0 14px; }
   .sheet .btn + .btn { margin-top: 8px; }
 
   .toast {
-    position: fixed; bottom: calc(88px + env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%);
-    background: var(--accent); color: #000; padding: 9px 18px; border-radius: 999px; font-size: 12px; font-weight: 800;
-    display: none; z-index: 600; white-space: nowrap; box-shadow: 0 6px 20px rgba(0,0,0,0.4);
+    position: fixed; bottom: calc(96px + env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%);
+    background: var(--accent); color: #000; padding: 10px 18px; border-radius: 999px; font-size: 12px; font-weight: 800;
+    display: none; z-index: 600; white-space: nowrap; box-shadow: 0 8px 24px rgba(0,0,0,0.5);
   }
 </style>
 </head>
@@ -1324,7 +1544,7 @@ FRONTEND_UI = r"""<!DOCTYPE html>
     <div class="brand" onclick="onBrandSecretTap()">
       <span class="dot"></span>
       <span>SNIPER</span>
-      <span id="normalStudioSub" class="sub">STUDIO 4.0</span>
+      <span id="normalStudioSub" class="sub">PRO 5.0</span>
       <span id="devTopBadge" class="dev-top-badge">⚡ DEVELOPER MODE</span>
     </div>
     <div class="top-actions">
@@ -1336,18 +1556,21 @@ FRONTEND_UI = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- ==================== VIEW 1: STUDIO (VIDEO SCRIPTS) ==================== -->
+  <!-- ==================== VIEW 1: STUDIO (VIDEO SCRIPTS + AI REWRITE) ==================== -->
   <section id="view-studio" class="view active">
-    <h1 class="title" data-i18n="studio_title"></h1>
-    <p class="lead" data-i18n="studio_lead"></p>
+    <div class="hero-box">
+      <div class="hero-kicker"><span>✨</span><span>AI VIRAL PRODUCTION ENGINE</span></div>
+      <h1 class="title" data-i18n="studio_title"></h1>
+      <p class="lead" data-i18n="studio_lead"></p>
+    </div>
 
     <div class="panel">
       <div class="lbl">
         <span data-i18n="src_label"></span>
-        <span class="mono" style="color:var(--accent);" id="detectBadge">WB • OZON • WEB</span>
+        <span class="mono" style="color:var(--accent);">WB • OZON • WEB</span>
       </div>
 
-      <!-- MODERN MOBILE SMART INPUT -->
+      <!-- SMART INPUT POD -->
       <div class="smart-input-pod">
         <div class="smart-input-row">
           <div class="smart-icon">🔗</div>
@@ -1380,7 +1603,7 @@ FRONTEND_UI = r"""<!DOCTYPE html>
       </div>
 
       <button id="submitBtn" class="btn" onclick="startGeneration()">
-        <span>⚡</span><span data-i18n="generate"></span><span>→</span>
+        <span>⚡</span><span data-i18n="generate"></span><span id="scriptCostBtnBadge">(100 ★)</span>
       </button>
       <div class="cost-note" id="costNote"></div>
     </div>
@@ -1399,7 +1622,7 @@ FRONTEND_UI = r"""<!DOCTYPE html>
 
     <!-- RESULTS -->
     <div id="results">
-      <div class="prod-head" id="pHeader"></div>
+      <div class="prod-head stagger-card" id="pHeader"></div>
       <div class="tabs">
         <button class="tab-btn active" onclick="setTab('scripts', this)" data-i18n="tab_scripts"></button>
         <button class="tab-btn" onclick="setTab('tgposts', this)" data-i18n="tab_tgposts"></button>
@@ -1417,8 +1640,11 @@ FRONTEND_UI = r"""<!DOCTYPE html>
 
   <!-- ==================== VIEW 2: TG AD POSTS + ERID + WATERMARK ==================== -->
   <section id="view-tgads" class="view">
-    <h1 class="title" data-i18n="tg_title"></h1>
-    <p class="lead" data-i18n="tg_lead"></p>
+    <div class="hero-box">
+      <div class="hero-kicker"><span>📢</span><span>TELEGRAM AD SEEDING & ERID</span></div>
+      <h1 class="title" data-i18n="tg_title"></h1>
+      <p class="lead" data-i18n="tg_lead"></p>
+    </div>
 
     <div class="panel">
       <span class="lbl" data-i18n="src_label"></span>
@@ -1448,7 +1674,7 @@ FRONTEND_UI = r"""<!DOCTYPE html>
       <div id="eridLiveBox" class="erid-preview" style="display:none;"></div>
 
       <button id="tgGenBtn" class="btn" style="margin-top:12px;" onclick="generateStandaloneTgPosts()">
-        <span>✨</span><span data-i18n="tg_generate"></span><span id="tgCostLabel">(5 ★)</span>
+        <span>✨</span><span data-i18n="tg_generate"></span><span id="tgCostLabel">(75 ★)</span>
       </button>
     </div>
 
@@ -1494,17 +1720,17 @@ FRONTEND_UI = r"""<!DOCTYPE html>
   <section id="view-cabinet" class="view">
     <div class="card"><div class="profile" id="cabProfile"></div></div>
 
-    <!-- PERSONAL DEVELOPER CONSOLE (VISIBLE ONLY TO OWNER) -->
+    <!-- PERSONAL DEVELOPER CONSOLE -->
     <div id="devConsoleCard" class="dev-console">
       <div class="dev-console-head">
         <div class="dev-console-title"><span>⚡</span><span>DEVELOPER MODE // ROOT ACCESS</span></div>
         <span class="tag" style="background:var(--accent); color:#000; font-weight:800; border:none;">ACTIVE</span>
       </div>
       <div style="font-size:12px; color:#d1d1e0; line-height:1.45;">
-        Персональный режим владельца активирован. Все генерации сценариев и TG-постов работают <strong>бесплатно и без ограничений (∞)</strong>.
+        Персональный режим владельца активирован. Все генерации сценариев (100 ★), рерайты и TG-посты (75 ★) работают <strong>бесплатно и без ограничений (∞)</strong>.
       </div>
       <div class="dev-actions-grid">
-        <button class="btn small" onclick="devAddCredits(1000)">+1000 КРЕДИТОВ</button>
+        <button class="btn small" onclick="devAddCredits(1000)">+1000 ★ НА БАЛАНС</button>
         <button class="btn ghost small" onclick="toggleDevMode(false)">ОТКЛЮЧИТЬ DEV MODE</button>
       </div>
     </div>
@@ -1571,7 +1797,7 @@ FRONTEND_UI = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<!-- BOTTOM NAVIGATION (3 ITEMS) -->
+<!-- FLOATING GLASS BOTTOM NAVIGATION -->
 <nav class="nav">
   <div class="nav-inner">
     <button id="nav-studio" class="active" onclick="showView('studio')">
@@ -1603,13 +1829,12 @@ FRONTEND_UI = r"""<!DOCTYPE html>
     try {
       tg.ready();
       tg.expand();
-      if (tg.setHeaderColor) tg.setHeaderColor('#060609');
-      if (tg.setBackgroundColor) tg.setBackgroundColor('#060609');
+      if (tg.setHeaderColor) tg.setHeaderColor('#050508');
+      if (tg.setBackgroundColor) tg.setBackgroundColor('#050508');
     } catch (e) {}
   }
   const tgUser = (tg && tg.initDataUnsafe && tg.initDataUnsafe.user) ? tg.initDataUnsafe.user : null;
 
-  // ================= Auto-Detect Owner (Developer Mode) =================
   function checkIsDefaultOwner() {
     if (!tgUser) return false;
     if (SERVER_ADMIN_ID && String(tgUser.id) === String(SERVER_ADMIN_ID)) return true;
@@ -1630,46 +1855,50 @@ FRONTEND_UI = r"""<!DOCTYPE html>
   const I18N = {
     ru: {
       nav_studio: 'Сценарии', nav_tgads: 'TG Посты & ERID', nav_cabinet: 'Кабинет',
-      studio_title: 'Виральные ролики и суфлёр',
-      studio_lead: 'Вставь ссылку или артикул WB / Ozon — сразу увидишь карточку товара, получишь сценарии, суфлёр и посты.',
+      studio_title: 'Виральные сценарии, AI-Рерайт и Суфлёр',
+      studio_lead: 'Вставь ссылку WB / Ozon — получи сценарии с быстрым рерайтом («Короче / Дерзко / Нативнее») и встроенным суфлёром.',
       src_label: 'Товар (ссылка или артикул)',
       src_ph: 'Вставь ссылку WB, Ozon или артикул...',
       paste: 'Вставить',
       fmt_label: 'Формат ролика', tone_label: 'Тональность подачи',
       f_ugc: 'UGC обзор', f_ps: 'Боль → Решение', f_unb: 'Распаковка / ASMR', f_aes: 'Aesthetic', f_story: 'Сторителлинг',
       t_native: 'Нативный', t_aggr: 'Дерзкий', t_humor: 'Юмор', t_lux: 'Премиум',
-      generate: 'Собрать сценарии и посты', cost: 'Стоимость полного разбора: {n} кр.',
+      generate: 'Создать сценарии', cost: 'Стоимость генерации сценария: {n} ★ (AI-рерайты внутри бесплатно)',
       cost_dev: '⚡ DEVELOPER MODE: БЕСПЛАТНО (БЕЗЛИМИТ ∞)',
       tab_scripts: 'Сценарии', tab_tgposts: 'TG Посты', tab_hooks: 'Хуки', tab_video: 'AI Видео', tab_seo: 'ЦА & SEO',
       frame: 'Кадр', voice: 'Озвучка', screen_text: 'Текст', hook: 'ХУК', cta: 'CTA',
       copy: 'КОПИРОВАТЬ', copy_all: 'ВЕСЬ СЦЕНАРИЙ', copy_seo: 'КОПИРОВАТЬ SEO', copied: 'Скопировано в буфер!',
       prompter: '🎬 СУФЛЁР',
+      rw_title: '✨ БЫСТРЫЙ AI-РЕРАЙТ СЦЕНАРИЯ (БЕСПЛАТНО):',
+      rw_shorter: '✂️ Короче', rw_longer: '📝 Подробнее', rw_bolder: '🔥 Дерзко', rw_native: '💬 Нативнее', rw_funny: '😂 С юмором', rw_custom: '✍️ Своя правка',
+      rw_ph: 'Напр.: сделай от лица девушки / добавь акцент на скидку 50%...',
+      rw_go: 'Переписать', rw_loading: '⚡ AI переписывает сценарий...',
       audience: 'Целевая аудитория', pains: 'Боли ЦА', features: 'Главные фишки', seo_title: 'SEO описание и хэштеги',
       virality: 'виральность', script: 'Сценарий',
       tg_title: 'Рекламные TG-посты & Маркировка',
-      tg_lead: 'Генерация нативных постов для блогеров с автоматической маркировкой рекламы (erid) и водяным знаком на фото.',
+      tg_lead: 'Нативные посты для блогеров и каналов с авто-маркировкой (erid) и водяным знаком на фото.',
       erid_title: 'Маркировка рекламы (ОРД / ERID)',
-      tg_generate: 'Сгенерировать 3 рекламных поста',
+      tg_generate: 'Сгенерировать 3 поста',
       wm_title: 'Водяной знак и ERID на фото товара',
       wm_desc: 'Автоматически берёт фото спарсенного товара (или загрузи своё) и накладывает твой ник и токен erid.',
-      balance: 'Твой баланс', credits: 'кредитов для генераций', topup: 'Пополнить через Telegram Stars',
-      topup_title: 'Пополнение баланса (Telegram Stars ★)',
-      gens: 'Генераций', spent: 'Потрачено кр.',
-      pack_credits: 'кредитов', popular: 'Хит',
+      balance: 'Твой баланс', credits: '★ Stars на балансе (1 сценарий = 100 ★, 1 пост = 75 ★)', topup: 'Пополнить баланс через Telegram Stars',
+      topup_title: 'Пакеты пополнения (Telegram Stars ★)',
+      gens: 'Создано проектов', spent: 'Потрачено ★',
+      pack_credits: '★ на баланс', popular: 'Хит выбора',
       promo: 'Промокод', promo_ph: 'Введи промокод (напр. SNIPER)', apply: 'Применить',
-      promo_ok: 'Промокод активирован: +{n} кр.', promo_bad: 'Неверный промокод', promo_used: 'Промокод уже использован',
-      history: 'История проектов', clear: 'Очистить', history_empty: 'Пока пусто. Сгенерируй свой первый проект.',
+      promo_ok: 'Промокод активирован: +{n} ★', promo_bad: 'Неверный промокод', promo_used: 'Промокод уже использован',
+      history: 'История проектов', clear: 'Очистить', history_empty: 'Пока пусто. Сгенерируй свой первый сценарий.',
       transactions: 'История операций', tx_empty: 'Операций пока нет',
-      tx_bonus: 'Приветственный бонус', tx_topup: 'Пополнение Stars ★', tx_gen: 'Генерация проекта', tx_promo: 'Промокод',
+      tx_bonus: 'Приветственный бонус', tx_topup: 'Пополнение Stars ★', tx_gen: 'Генерация сценария', tx_tg: 'Генерация TG-поста', tx_promo: 'Промокод',
       open: 'Открыть', plan: 'Creator PRO', guest: 'Креатор',
-      pay_title: 'Пополнение баланса', pay_pack: 'Пакет', pay_price: 'К оплате',
-      pay_note: 'Оплата проходит официально через Telegram Stars (★). Кредиты начисляются моментально после подтверждения.',
+      pay_title: 'Пополнение баланса ★', pay_pack: 'Зачислится на баланс', pay_price: 'К оплате',
+      pay_note: 'Официальная безопасная оплата через Telegram Stars (★). Звёзды зачисляются на баланс мгновенно.',
       pay_stars_btn: '⭐ Оплатить {s} Stars',
       pay_demo_btn: '⚡ Тестовое пополнение (Демо)',
       cancel: 'Отмена', processing: 'Создаём счёт...',
-      pay_done: 'Баланс пополнен: +{n} кр.!',
-      nofunds_title: 'Недостаточно кредитов',
-      nofunds_text: 'Для генерации нужно {n} кр. Пополни баланс через Telegram Stars.',
+      pay_done: 'Баланс пополнен: +{n} ★!',
+      nofunds_title: 'Недостаточно ★ на балансе',
+      nofunds_text: 'Для этого действия нужно {n} ★ (1 сценарий = 100 ★, TG-пост = 75 ★). Пополни баланс за пару секунд.',
       err_query: 'Вставь ссылку, артикул или описание товара',
       err_timeout: 'Сервер отвечает слишком долго. Попробуй ещё раз.',
       err_network: 'Ошибка соединения. Попробуй ещё раз.',
@@ -1678,46 +1907,50 @@ FRONTEND_UI = r"""<!DOCTYPE html>
     },
     en: {
       nav_studio: 'Scripts', nav_tgads: 'TG Ads & ERID', nav_cabinet: 'Account',
-      studio_title: 'Viral Scripts & Teleprompter',
-      studio_lead: 'Paste a WB / Ozon / website link — get instant product overview, scripts, teleprompter and ad posts.',
+      studio_title: 'Viral Scripts, AI Rewrite & Teleprompter',
+      studio_lead: 'Paste a WB / Ozon / web link — get scripts with 1-tap AI Rewrite ("Shorter / Bolder / Native") and Teleprompter.',
       src_label: 'Product (link or SKU)',
       src_ph: 'Paste WB, Ozon or website link / SKU...',
       paste: 'Paste',
       fmt_label: 'Video format', tone_label: 'Tone',
       f_ugc: 'UGC review', f_ps: 'Pain → Solution', f_unb: 'Unboxing / ASMR', f_aes: 'Aesthetic', f_story: 'Storytelling',
       t_native: 'Native', t_aggr: 'Bold', t_humor: 'Humor', t_lux: 'Premium',
-      generate: 'Generate Scripts & Posts', cost: 'Full funnel cost: {n} cr.',
+      generate: 'Generate Scripts', cost: 'Script generation cost: {n} ★ (AI rewrites inside are free)',
       cost_dev: '⚡ DEVELOPER MODE: FREE (UNLIMITED ∞)',
       tab_scripts: 'Scripts', tab_tgposts: 'TG Posts', tab_hooks: 'Hooks', tab_video: 'AI Video', tab_seo: 'Audience & SEO',
       frame: 'Frame', voice: 'Voice', screen_text: 'Text', hook: 'HOOK', cta: 'CTA',
       copy: 'COPY', copy_all: 'FULL SCRIPT', copy_seo: 'COPY SEO', copied: 'Copied to clipboard!',
       prompter: '🎬 PROMPTER',
+      rw_title: '✨ 1-TAP AI SCRIPT REWRITE (FREE):',
+      rw_shorter: '✂️ Shorter', rw_longer: '📝 Detailed', rw_bolder: '🔥 Bolder', rw_native: '💬 More Native', rw_funny: '😂 Funny', rw_custom: '✍️ Custom',
+      rw_ph: 'E.g.: make it from a girl perspective / emphasize 50% discount...',
+      rw_go: 'Rewrite', rw_loading: '⚡ AI is rewriting script...',
       audience: 'Target audience', pains: 'Audience pains', features: 'Killer features', seo_title: 'SEO caption & tags',
       virality: 'virality', script: 'Script',
       tg_title: 'Telegram Ad Posts & ERID',
       tg_lead: 'Create native blogger ad posts with legal ad disclosure (erid) and product photo watermarks.',
       erid_title: 'Ad Disclosure (ERID / Legal)',
-      tg_generate: 'Generate 3 Telegram Ad Posts',
+      tg_generate: 'Generate 3 Ad Posts',
       wm_title: 'Product Photo Watermark Studio',
       wm_desc: 'Automatically loads the product image (or upload yours) and stamps your @handle and erid token.',
-      balance: 'Your balance', credits: 'generation credits', topup: 'Top up with Telegram Stars',
-      topup_title: 'Top up balance (Telegram Stars ★)',
-      gens: 'Generations', spent: 'Credits spent',
-      pack_credits: 'credits', popular: 'Hot',
+      balance: 'Your balance', credits: '★ Stars balance (1 script = 100 ★, 1 post = 75 ★)', topup: 'Top up with Telegram Stars',
+      topup_title: 'Top up packages (Telegram Stars ★)',
+      gens: 'Projects created', spent: 'Stars spent ★',
+      pack_credits: '★ balance', popular: 'Best Value',
       promo: 'Promo code', promo_ph: 'Enter promo code (e.g. SNIPER)', apply: 'Apply',
-      promo_ok: 'Promo applied: +{n} cr.', promo_bad: 'Invalid promo code', promo_used: 'Promo code already used',
-      history: 'Project history', clear: 'Clear', history_empty: 'Nothing here yet. Generate your first project.',
+      promo_ok: 'Promo applied: +{n} ★', promo_bad: 'Invalid promo code', promo_used: 'Promo code already used',
+      history: 'Project history', clear: 'Clear', history_empty: 'Nothing here yet. Generate your first script.',
       transactions: 'Transactions', tx_empty: 'No transactions yet',
-      tx_bonus: 'Welcome bonus', tx_topup: 'Telegram Stars Top-up ★', tx_gen: 'Project generation', tx_promo: 'Promo code',
+      tx_bonus: 'Welcome bonus', tx_topup: 'Telegram Stars Top-up ★', tx_gen: 'Script generation', tx_tg: 'TG Post generation', tx_promo: 'Promo code',
       open: 'Open', plan: 'Creator PRO', guest: 'Creator',
-      pay_title: 'Top Up Balance', pay_pack: 'Package', pay_price: 'Price',
-      pay_note: 'Secure official payment via Telegram Stars (★). Credits are added immediately.',
+      pay_title: 'Top Up Balance ★', pay_pack: 'Added to balance', pay_price: 'Price',
+      pay_note: 'Secure official payment via Telegram Stars (★). Added immediately.',
       pay_stars_btn: '⭐ Pay {s} Stars',
       pay_demo_btn: '⚡ Instant Demo Top-up',
       cancel: 'Cancel', processing: 'Creating invoice...',
-      pay_done: 'Balance topped up: +{n} cr.!',
-      nofunds_title: 'Not enough credits',
-      nofunds_text: 'You need {n} cr. Top up your balance via Telegram Stars.',
+      pay_done: 'Balance topped up: +{n} ★!',
+      nofunds_title: 'Not enough ★ balance',
+      nofunds_text: 'You need {n} ★ (1 script = 100 ★, TG post = 75 ★). Top up via Telegram Stars.',
       err_query: 'Enter a link, SKU or product description',
       err_timeout: 'Server took too long. Please try again.',
       err_network: 'Connection error. Please try again.',
@@ -1726,16 +1959,16 @@ FRONTEND_UI = r"""<!DOCTYPE html>
     }
   };
 
-  // ================= State =================
-  const STORE_KEY = 'sniper_state_v6';
-  const COST = 10;
-  const TG_COST = 5;
-  const WELCOME_BONUS = 100;
-  const PROMO_CODES = { 'SNIPER': 50, 'UGC2026': 100 };
+  // ================= Pricing & State (100 Stars / Script, 75 Stars / Post) =================
+  const STORE_KEY = 'sniper_state_v8';
+  const COST = 100;      // 100 Stars per Script Funnel
+  const TG_COST = 75;    // 75 Stars per Telegram Ad Post
+  const WELCOME_BONUS = 100; // 1 free script generation on start
+  const PROMO_CODES = { 'SNIPER': 100, 'UGC2026': 150 };
   const PACKS = [
-    { id: 'pack_50',  credits: 50,  stars: 25,  pop: false },
-    { id: 'pack_150', credits: 150, stars: 65,  pop: true },
-    { id: 'pack_500', credits: 500, stars: 190, pop: false }
+    { id: 'pack_100',  credits: 100,  stars: 100, pop: false },
+    { id: 'pack_300',  credits: 300,  stars: 300, pop: true },
+    { id: 'pack_1000', credits: 1000, stars: 850, pop: false }
   ];
 
   function detectLang() {
@@ -1811,1018 +2044,4 @@ FRONTEND_UI = r"""<!DOCTYPE html>
     haptic('success');
   }
 
-  function devAddCredits(amount) {
-    S.balance += amount;
-    addTx('topup', amount);
-    saveState();
-    updateBalanceUI();
-    renderCabinet();
-    showToast(`+${amount} кр. начислено (DEV)!`);
-    haptic('success');
-  }
-
-  // ================= Helpers =================
-  let curFmt = 'ugc';
-  let curTone = 'native';
-  let lastResult = null;
-  let currentProductPreview = null;
-  const copyStore = [];
-  const prompterStore = [];
-
-  function esc(s) {
-    if (s === null || s === undefined) return '';
-    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-  }
-  function reg(txt) { copyStore.push(txt == null ? '' : String(txt)); return copyStore.length - 1; }
-  function copyIdx(i) { copy(copyStore[i]); }
-  function regTp(txt) { prompterStore.push(txt == null ? '' : String(txt)); return prompterStore.length - 1; }
-
-  let toastTimer = null;
-  function showToast(text) {
-    const el = document.getElementById('toast');
-    el.textContent = text;
-    el.style.display = 'block';
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => { el.style.display = 'none'; }, 1900);
-  }
-  function haptic(kind) {
-    try { if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred(kind || 'success'); } catch (e) {}
-  }
-  function fallbackCopy(txt) {
-    const ta = document.createElement('textarea');
-    ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
-    document.body.appendChild(ta); ta.select();
-    try { document.execCommand('copy'); } catch (e) {}
-    document.body.removeChild(ta);
-  }
-  function copy(txt) {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(txt).catch(() => fallbackCopy(txt));
-    } else {
-      fallbackCopy(txt);
-    }
-    showToast(t('copied'));
-    haptic('success');
-  }
-  function fmtDate(ts) {
-    try {
-      return new Date(ts).toLocaleString(S.lang === 'ru' ? 'ru-RU' : 'en-US', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
-    } catch (e) { return ''; }
-  }
-
-  // ================= Smart Input & Live Product Overview =================
-  let previewTimers = {};
-  function onSmartInput(el, mode) {
-    const val = (el.value || '').trim();
-    const clearBtn = document.getElementById(mode === 'main' ? 'clearMainBtn' : 'clearTgBtn');
-    if (clearBtn) clearBtn.style.display = val.length > 0 ? 'flex' : 'none';
-
-    const otherId = mode === 'main' ? 'tgQueryInp' : 'queryInp';
-    const otherEl = document.getElementById(otherId);
-    if (otherEl && !otherEl.value.trim()) otherEl.value = val;
-
-    clearTimeout(previewTimers[mode]);
-    const box = document.getElementById(mode === 'main' ? 'livePreviewMain' : 'livePreviewTg');
-    if (val.length < 5) {
-      if (box) box.style.display = 'none';
-      return;
-    }
-
-    previewTimers[mode] = setTimeout(() => fetchLivePreview(val, mode), 420);
-  }
-
-  async function pasteClipboard(inputId, mode) {
-    const el = document.getElementById(inputId);
-    try {
-      if (navigator.clipboard && navigator.clipboard.readText) {
-        const txt = await navigator.clipboard.readText();
-        if (txt) {
-          el.value = txt.trim();
-          onSmartInput(el, mode);
-          haptic('success');
-          return;
-        }
-      }
-    } catch (e) {}
-    el.focus();
-  }
-
-  function clearSmartInput(inputId, mode) {
-    const el = document.getElementById(inputId);
-    el.value = '';
-    onSmartInput(el, mode);
-    const box = document.getElementById(mode === 'main' ? 'livePreviewMain' : 'livePreviewTg');
-    if (box) box.style.display = 'none';
-  }
-
-  async function fetchLivePreview(query, mode) {
-    const box = document.getElementById(mode === 'main' ? 'livePreviewMain' : 'livePreviewTg');
-    if (!box) return;
-    try {
-      const resp = await fetch('/api/preview', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: query })
-      });
-      if (!resp.ok) return;
-      const d = await resp.json();
-      currentProductPreview = d;
-
-      const img = d.image ? `<img class="lp-thumb" src="${esc(d.image)}" alt="" onerror="this.style.display='none'">` : '';
-      const price = d.price ? `<span class="lp-price">${esc(d.price)}</span>` : '';
-      const brand = d.brand ? ` · ${esc(d.brand)}` : '';
-      const cat = d.category ? `${esc(d.category)}` : 'Готово к генерации';
-
-      box.innerHTML = `
-        <div class="lp-inner">
-          ${img}
-          <div class="lp-body">
-            <div class="lp-badges">
-              <span class="lp-badge">✓ ${esc(d.source || 'НАЙДЕНО')}</span>
-              ${price}
-            </div>
-            <div class="lp-title">${esc(d.title)}</div>
-            <div class="lp-sub">${cat}${brand}</div>
-          </div>
-        </div>
-      `;
-      box.style.display = 'block';
-      if (d.image) loadWatermarkProductImage(d.image);
-    } catch (e) {}
-  }
-
-  // ================= AI Live Terminal Animation =================
-  let termInterval = null;
-  function startAiTerminal(queryText) {
-    const term = document.getElementById('aiTerminal');
-    const bar = document.getElementById('termBar');
-    const pct = document.getElementById('termPercent');
-    const stream = document.getElementById('termStream');
-    term.style.display = 'block';
-    stream.innerHTML = '';
-
-    const pTitle = (currentProductPreview && currentProductPreview.title) ? currentProductPreview.title : queryText.slice(0, 42);
-    const pSource = (currentProductPreview && currentProductPreview.source) ? currentProductPreview.source : 'Web Source';
-    const pPrice = (currentProductPreview && currentProductPreview.price) ? ` (${currentProductPreview.price})` : '';
-
-    const logSteps = S.lang === 'ru' ? [
-      { p: 15, txt: `Подключение к ${pSource}: «${pTitle}»${pPrice}` },
-      { p: 32, txt: `Извлечение характеристик, УТП и болей целевой аудитории...` },
-      { p: 52, txt: `AI-продюсер: генерация 5 триггерных хуков (первые 2 секунды)...` },
-      { p: 71, txt: `Сборка покадрового сценария, озвучки для суфлёра и B-Roll промптов...` },
-      { p: 88, txt: `Копирайтинг 3 нативных рекламных постов для Telegram...` },
-      { p: 96, txt: `Финальная упаковка JSON-проекта...` }
-    ] : [
-      { p: 15, txt: `Connected to ${pSource}: "${pTitle}"${pPrice}` },
-      { p: 32, txt: `Extracting product specs, USP and audience pain points...` },
-      { p: 52, txt: `AI Producer: crafting 5 scroll-stopping hooks (0-2s)...` },
-      { p: 71, txt: `Writing scene-by-scene storyboard, teleprompter voiceover & AI prompts...` },
-      { p: 88, txt: `Drafting 3 native Telegram ad posts...` },
-      { p: 96, txt: `Finalizing project package...` }
-    ];
-
-    let idx = 0;
-    function pushStep() {
-      if (idx >= logSteps.length) return;
-      const item = logSteps[idx];
-      bar.style.width = item.p + '%';
-      pct.textContent = `AI ENGINE // ${item.p}%`;
-
-      const prevCursor = stream.querySelector('.term-cursor');
-      if (prevCursor) prevCursor.remove();
-
-      const line = document.createElement('div');
-      line.className = 'term-line';
-      line.innerHTML = `<span class="ok">▸</span><span>${esc(item.txt)}<span class="term-cursor"></span></span>`;
-      stream.appendChild(line);
-      stream.scrollTop = stream.scrollHeight;
-      idx++;
-    }
-
-    pushStep();
-    clearInterval(termInterval);
-    termInterval = setInterval(pushStep, 2300);
-  }
-
-  function stopAiTerminal() {
-    clearInterval(termInterval);
-    const term = document.getElementById('aiTerminal');
-    if (term) term.style.display = 'none';
-  }
-
-  // ================= Views & Tabs =================
-  function showView(name) {
-    ['studio', 'tgads', 'cabinet'].forEach(v => {
-      document.getElementById('view-' + v).classList.toggle('active', v === name);
-      document.getElementById('nav-' + v).classList.toggle('active', v === name);
-    });
-    if (name === 'cabinet') renderCabinet();
-    if (name === 'tgads') drawWatermark();
-    window.scrollTo(0, 0);
-  }
-  function setTab(name, btn) {
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-    btn.classList.add('active');
-    document.getElementById('tab-' + name).classList.add('active');
-  }
-  function bindChips(id, cb) {
-    document.querySelectorAll('#' + id + ' .chip').forEach(c => {
-      c.onclick = () => {
-        document.querySelectorAll('#' + id + ' .chip').forEach(x => x.classList.remove('active'));
-        c.classList.add('active');
-        cb(c.dataset.v);
-      };
-    });
-  }
-  bindChips('fmtChips', v => { curFmt = v; });
-  bindChips('toneChips', v => { curTone = v; });
-
-  function setLang(l) {
-    if (!I18N[l]) return;
-    S.lang = l;
-    saveState();
-    applyLang();
-  }
-  function applyLang() {
-    document.documentElement.lang = S.lang;
-    document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = t(el.dataset.i18n); });
-    document.querySelectorAll('[data-i18n-ph]').forEach(el => { el.placeholder = t(el.dataset.i18nPh); });
-    document.querySelectorAll('.lang-sw button').forEach(b => b.classList.toggle('active', b.dataset.l === S.lang));
-    document.getElementById('costNote').textContent = S.devMode ? t('cost_dev') : t('cost', { n: COST });
-    const tgCostLbl = document.getElementById('tgCostLabel');
-    if (tgCostLbl) tgCostLbl.textContent = S.devMode ? '(DEV ∞)' : '(5 ★)';
-    renderCabinet();
-    if (lastResult) renderResult(lastResult);
-  }
-
-  // ================= Teleprompter Studio =================
-  let tpPlaying = false;
-  let tpSpeed = 1.2;
-  let tpFontSize = 28;
-  let tpMirror = false;
-  let tpRaf = null;
-  let tpLastTs = 0;
-
-  function openTeleprompterIdx(idx) {
-    const text = prompterStore[idx] || '';
-    openTeleprompterText(text);
-  }
-
-  function openTeleprompterText(text) {
-    stopTeleprompterScroll();
-    const modal = document.getElementById('teleprompterModal');
-    const txtEl = document.getElementById('tpText');
-    const stage = document.getElementById('tpStage');
-    txtEl.textContent = text;
-    txtEl.style.fontSize = tpFontSize + 'px';
-    stage.scrollTop = 0;
-    modal.classList.add('open');
-    haptic('success');
-  }
-
-  function closeTeleprompter() {
-    stopTeleprompterScroll();
-    document.getElementById('teleprompterModal').classList.remove('open');
-  }
-
-  function resetTeleprompter() {
-    stopTeleprompterScroll();
-    document.getElementById('tpStage').scrollTop = 0;
-  }
-
-  function toggleTpMirror() {
-    tpMirror = !tpMirror;
-    document.getElementById('tpStage').classList.toggle('mirror', tpMirror);
-    document.getElementById('tpMirrorBtn').style.borderColor = tpMirror ? 'var(--accent)' : 'var(--border)';
-  }
-
-  function onTpSpeedChange(val) {
-    tpSpeed = parseFloat(val) || 1.2;
-    document.getElementById('tpSpeedVal').textContent = tpSpeed.toFixed(1) + 'x';
-  }
-
-  function changeTpFont(delta) {
-    tpFontSize = Math.min(46, Math.max(18, tpFontSize + delta));
-    document.getElementById('tpText').style.fontSize = tpFontSize + 'px';
-  }
-
-  function startTpWithCountdown() {
-    if (tpPlaying) {
-      stopTeleprompterScroll();
-      return;
-    }
-    const cd = document.getElementById('tpCountdown');
-    let count = 3;
-    cd.textContent = count;
-    cd.style.display = 'flex';
-    const iv = setInterval(() => {
-      count--;
-      if (count > 0) {
-        cd.textContent = count;
-        haptic('warning');
-      } else {
-        clearInterval(iv);
-        cd.style.display = 'none';
-        startTeleprompterScroll();
-      }
-    }, 850);
-  }
-
-  function toggleTeleprompterPlay() {
-    if (document.activeElement === document.getElementById('tpText')) return;
-    if (tpPlaying) stopTeleprompterScroll();
-    else startTeleprompterScroll();
-  }
-
-  function startTeleprompterScroll() {
-    tpPlaying = true;
-    tpLastTs = performance.now();
-    const btn = document.getElementById('tpPlayBtn');
-    btn.textContent = '⏸ ПАУЗА (ТАП ПО ЭКРАНУ)';
-    btn.classList.add('ghost');
-
-    const stage = document.getElementById('tpStage');
-    function step(now) {
-      if (!tpPlaying) return;
-      const dt = (now - tpLastTs) / 1000;
-      tpLastTs = now;
-      stage.scrollTop += (38 * tpSpeed) * dt;
-      if (stage.scrollTop + stage.clientHeight >= stage.scrollHeight - 4) {
-        stopTeleprompterScroll();
-        return;
-      }
-      tpRaf = requestAnimationFrame(step);
-    }
-    tpRaf = requestAnimationFrame(step);
-  }
-
-  function stopTeleprompterScroll() {
-    tpPlaying = false;
-    if (tpRaf) cancelAnimationFrame(tpRaf);
-    const btn = document.getElementById('tpPlayBtn');
-    if (btn) {
-      btn.textContent = '▶ ПРОДОЛЖИТЬ ЗАПИСЬ';
-      btn.classList.remove('ghost');
-    }
-  }
-
-  // ================= ERID & Watermark Studio =================
-  function getEridFooterText() {
-    const org = (document.getElementById('eridOrgInp')?.value || '').trim();
-    const tok = (document.getElementById('eridTokenInp')?.value || '').trim();
-    const link = (document.getElementById('eridLinkInp')?.value || '').trim();
-    let lines = [];
-    if (link) lines.push(`👉 Ссылка / Артикул: ${link}`);
-    if (org || tok) {
-      const cleanTok = tok.replace(/^erid:\s*/i, '');
-      lines.push(`Реклама. ${org || 'Рекламодатель'}${cleanTok ? `, erid: ${cleanTok}` : ''}`);
-    }
-    return lines.join('\n');
-  }
-
-  function updateEridPreview() {
-    const footer = getEridFooterText();
-    const box = document.getElementById('eridLiveBox');
-    const wmErid = document.getElementById('wmEridInp');
-    const tok = (document.getElementById('eridTokenInp')?.value || '').trim().replace(/^erid:\s*/i, '');
-    if (wmErid && tok) wmErid.value = `Реклама • erid: ${tok}`;
-
-    if (footer) {
-      box.style.display = 'block';
-      box.textContent = footer;
-    } else {
-      box.style.display = 'none';
-    }
-    drawWatermark();
-  }
-
-  let wmPos = 'br';
-  let wmBaseImg = null;
-
-  function setWmPos(pos, btn) {
-    wmPos = pos;
-    document.querySelectorAll('#wmPosChips .chip').forEach(c => c.classList.remove('active'));
-    btn.classList.add('active');
-    drawWatermark();
-  }
-
-  function loadWatermarkProductImage(url) {
-    if (!url) return;
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = () => { wmBaseImg = img; drawWatermark(); };
-    img.src = '/api/proxy-image?url=' + encodeURIComponent(url);
-  }
-
-  function uploadCustomWmImage(ev) {
-    const file = ev.target.files && ev.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = e => {
-      const img = new Image();
-      img.onload = () => { wmBaseImg = img; drawWatermark(); };
-      img.src = e.target.result;
-    };
-    reader.readAsDataURL(file);
-  }
-
-  function drawWatermark() {
-    const canvas = document.getElementById('wmCanvas');
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    const W = canvas.width;
-    const H = canvas.height;
-
-    ctx.fillStyle = '#0c0c12';
-    ctx.fillRect(0, 0, W, H);
-
-    if (wmBaseImg) {
-      const ratio = Math.max(W / wmBaseImg.width, H / wmBaseImg.height);
-      const nw = wmBaseImg.width * ratio;
-      const nh = wmBaseImg.height * ratio;
-      ctx.drawImage(wmBaseImg, (W - nw) / 2, (H - nh) / 2, nw, nh);
-    } else {
-      ctx.strokeStyle = 'rgba(212,255,58,0.18)';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(24, 24, W - 48, H - 48);
-      ctx.fillStyle = '#666677';
-      ctx.font = '600 18px Manrope, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText('Фото товара подгрузится по ссылке', W / 2, H / 2 - 10);
-      ctx.fillText('или нажми «📷 Своё фото» ниже', W / 2, H / 2 + 20);
-    }
-
-    const wmText = (document.getElementById('wmTextInp')?.value || '').trim();
-    const eridText = (document.getElementById('wmEridInp')?.value || '').trim();
-
-    if (wmText) {
-      ctx.save();
-      if (wmPos === 'center') {
-        ctx.translate(W / 2, H / 2);
-        ctx.rotate(-Math.PI / 6);
-        ctx.font = '800 38px Unbounded, sans-serif';
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.28)';
-        ctx.textAlign = 'center';
-        ctx.fillText(wmText, 0, 0);
-      } else {
-        ctx.font = '700 20px Manrope, sans-serif';
-        const padX = 16, padY = 10;
-        const tw = ctx.measureText(wmText).width;
-        const bw = tw + padX * 2, bh = 38;
-        let bx = W - bw - 20, by = H - bh - 20;
-        if (wmPos === 'bl') bx = 20;
-        if (wmPos === 'tl') { bx = 20; by = 20; }
-
-        ctx.fillStyle = 'rgba(7, 7, 10, 0.72)';
-        ctx.beginPath();
-        ctx.roundRect(bx, by, bw, bh, 10);
-        ctx.fill();
-
-        ctx.fillStyle = '#d4ff3a';
-        ctx.textAlign = 'left';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(wmText, bx + padX, by + bh / 2);
-      }
-      ctx.restore();
-    }
-
-    if (eridText) {
-      ctx.save();
-      ctx.font = '600 14px JetBrains Mono, monospace';
-      const tw = ctx.measureText(eridText).width;
-      const bw = tw + 20, bh = 28;
-      const bx = 20, by = H - bh - (wmPos === 'bl' ? 68 : 20);
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.78)';
-      ctx.beginPath();
-      ctx.roundRect(bx, by, bw, bh, 7);
-      ctx.fill();
-      ctx.fillStyle = '#ffffff';
-      ctx.textAlign = 'left';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(eridText, bx + 10, by + bh / 2);
-      ctx.restore();
-    }
-  }
-
-  function downloadWatermarkedImage() {
-    const canvas = document.getElementById('wmCanvas');
-    const url = canvas.toDataURL('image/png');
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'sniper_ugc_post.png';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    showToast('Фото сохранено!');
-    haptic('success');
-  }
-
-  // ================= Modal & Real Telegram Stars Payment =================
-  function openModal(html) {
-    document.getElementById('sheet').innerHTML = html;
-    document.getElementById('overlay').classList.add('open');
-  }
-  function closeModal() {
-    document.getElementById('overlay').classList.remove('open');
-  }
-  function updateBalanceUI() {
-    const devTop = document.getElementById('devTopBadge');
-    const normSub = document.getElementById('normalStudioSub');
-    const devCard = document.getElementById('devConsoleCard');
-    if (devTop) devTop.classList.toggle('active', !!S.devMode);
-    if (normSub) normSub.style.display = S.devMode ? 'none' : 'inline-block';
-    if (devCard) devCard.classList.toggle('active', !!S.devMode);
-
-    document.getElementById('balChip').textContent = S.devMode ? '∞ DEV' : S.balance;
-    const cb = document.getElementById('cabBalance');
-    if (cb) cb.textContent = S.devMode ? '∞' : S.balance;
-  }
-  function addTx(type, amount) {
-    S.tx.unshift({ type: type, amount: amount, ts: Date.now() });
-    S.tx = S.tx.slice(0, 40);
-  }
-  function scrollToTopup() {
-    const el = document.getElementById('topupSec');
-    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  }
-
-  function openPay(i) {
-    const p = PACKS[i];
-    if (!p) return;
-    openModal(`
-      <h3>${esc(t('pay_title'))}</h3>
-      <div class="kv"><span>${esc(t('pay_pack'))}</span><strong>+${p.credits} ${esc(t('pack_credits'))}</strong></div>
-      <div class="kv"><span>${esc(t('pay_price'))}</span><strong style="color:var(--accent);">${p.stars} ★ Stars</strong></div>
-      <p>${esc(t('pay_note'))}</p>
-      <button class="btn" id="payStarsBtn" onclick="payWithTelegramStars(${i})">${esc(t('pay_stars_btn', { s: p.stars }))}</button>
-      <button class="btn ghost" onclick="doDemoPay(${i})">${esc(t('pay_demo_btn'))}</button>
-      <button class="btn ghost" onclick="closeModal()">${esc(t('cancel'))}</button>
-    `);
-  }
-
-  async function payWithTelegramStars(i) {
-    const p = PACKS[i];
-    if (!p) return;
-    const btn = document.getElementById('payStarsBtn');
-    if (btn) { btn.disabled = true; btn.textContent = t('processing'); }
-
-    try {
-      const resp = await fetch('/api/create-stars-invoice', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          pack_id: p.id,
-          user_id: (tgUser && tgUser.id) ? tgUser.id : 0,
-          lang: S.lang
-        })
-      });
-      const data = await resp.json();
-      if (!resp.ok || !data.invoice_link) {
-        throw new Error(data.detail || 'Could not create Stars invoice');
-      }
-
-      if (tg && tg.openInvoice) {
-        tg.openInvoice(data.invoice_link, function(status) {
-          if (status === 'paid') {
-            creditUserBalance(p.credits);
-          } else if (btn) {
-            btn.disabled = false;
-            btn.textContent = t('pay_stars_btn', { s: p.stars });
-          }
-        });
-      } else {
-        window.open(data.invoice_link, '_blank');
-        if (btn) {
-          btn.disabled = false;
-          btn.textContent = t('pay_stars_btn', { s: p.stars });
-        }
-      }
-    } catch (e) {
-      showToast(e.message || 'Ошибка создания инвойса');
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = t('pay_stars_btn', { s: p.stars });
-      }
-    }
-  }
-
-  function doDemoPay(i) {
-    const p = PACKS[i];
-    if (!p) return;
-    creditUserBalance(p.credits);
-  }
-
-  function creditUserBalance(credits) {
-    S.balance += credits;
-    addTx('topup', credits);
-    saveState();
-    updateBalanceUI();
-    renderCabinet();
-    closeModal();
-    showToast(t('pay_done', { n: credits }));
-    haptic('success');
-  }
-
-  function openNoFunds(needed) {
-    openModal(`
-      <h3>${esc(t('nofunds_title'))}</h3>
-      <p>${esc(t('nofunds_text', { n: needed || COST }))}</p>
-      <button class="btn" onclick="closeModal(); showView('cabinet'); setTimeout(scrollToTopup, 80);">${esc(t('topup'))}</button>
-      <button class="btn ghost" onclick="closeModal()">${esc(t('cancel'))}</button>
-    `);
-  }
-
-  function applyPromo() {
-    const inp = document.getElementById('promoInp');
-    const code = (inp.value || '').trim().toUpperCase();
-    if (!code) return;
-
-    // Secret promo code to toggle Developer Mode
-    if (code === 'DEVMODE' || code === 'DEVELOPER') {
-      inp.value = '';
-      toggleDevMode(true);
-      renderCabinet();
-      return;
-    }
-
-    if (S.promoUsed) { showToast(t('promo_used')); haptic('error'); return; }
-    const bonus = PROMO_CODES[code];
-    if (!bonus) { showToast(t('promo_bad')); haptic('error'); return; }
-    S.promoUsed = true;
-    S.balance += bonus;
-    addTx('promo', bonus);
-    saveState();
-    updateBalanceUI();
-    inp.value = '';
-    renderCabinet();
-    showToast(t('promo_ok', { n: bonus }));
-    haptic('success');
-  }
-
-  // ================= Cabinet Render =================
-  function renderCabinet() {
-    const name = tgUser ? ([tgUser.first_name, tgUser.last_name].filter(Boolean).join(' ') || tgUser.username || t('guest')) : t('guest');
-    const sub = tgUser ? (tgUser.username ? '@' + tgUser.username : 'ID ' + tgUser.id) : 'Telegram Mini App';
-    const initial = (name || '?').trim().charAt(0).toUpperCase() || '?';
-    const avatar = (tgUser && tgUser.photo_url)
-      ? `<div class="avatar"><img src="${esc(tgUser.photo_url)}" alt="" onerror="this.parentNode.textContent='${esc(initial)}'"></div>`
-      : `<div class="avatar">${esc(initial)}</div>`;
-    const roleTag = S.devMode
-      ? `<span class="tag" style="background:var(--accent); color:#000; font-weight:800; border:none;">⚡ OWNER // DEV MODE</span>`
-      : `<span class="tag">${esc(t('plan'))}</span>`;
-
-    document.getElementById('cabProfile').innerHTML = `
-      ${avatar}
-      <div style="min-width:0;">
-        <div style="font-weight:800; font-size:16px;">${esc(name)}</div>
-        <div style="color:var(--muted); font-size:12px; margin-top:2px;">${esc(sub)} · ${roleTag}</div>
-      </div>`;
-
-    updateBalanceUI();
-
-    document.getElementById('cabStats').innerHTML = `
-      <div class="stat"><div class="v">${S.gens}</div><div class="k">${esc(t('gens'))}</div></div>
-      <div class="stat"><div class="v">${S.spent}</div><div class="k">${esc(t('spent'))}</div></div>`;
-
-    document.getElementById('cabPacks').innerHTML = PACKS.map((p, i) => `
-      <button class="pack ${p.pop ? 'pop' : ''}" onclick="openPay(${i})">
-        ${p.pop ? `<span class="badge">${esc(t('popular'))}</span>` : ''}
-        <div class="pc">+${p.credits}</div>
-        <div class="pk">${esc(t('pack_credits'))}</div>
-        <div class="pp">★ ${p.stars} Stars</div>
-      </button>`).join('');
-
-    const hist = document.getElementById('cabHistory');
-    if (!S.history.length) {
-      hist.innerHTML = `<div class="empty">${esc(t('history_empty'))}</div>`;
-    } else {
-      hist.innerHTML = S.history.map((it, i) => `
-        <div class="list-item">
-          <div class="li-main">
-            <div class="li-title">${esc(it.title)}</div>
-            <div class="li-sub">${esc(fmtDate(it.ts))} · ${esc(it.query)}</div>
-          </div>
-          <div style="display:flex; gap:6px; flex-shrink:0;">
-            <button class="copy-btn" onclick="openHistory(${i})">${esc(t('open'))}</button>
-            <button class="copy-btn" onclick="delHistory(${i})">✕</button>
-          </div>
-        </div>`).join('');
-    }
-
-    const tx = document.getElementById('cabTx');
-    if (!S.tx.length) {
-      tx.innerHTML = `<div class="empty">${esc(t('tx_empty'))}</div>`;
-    } else {
-      tx.innerHTML = S.tx.slice(0, 15).map(x => `
-        <div class="list-item">
-          <div class="li-main">
-            <div class="li-title">${esc(t('tx_' + x.type))}</div>
-            <div class="li-sub">${esc(fmtDate(x.ts))}</div>
-          </div>
-          <div class="${x.amount >= 0 ? 'plus' : 'minus'}">${x.amount >= 0 ? '+' : ''}${x.amount}</div>
-        </div>`).join('');
-    }
-  }
-  function openHistory(i) {
-    const it = S.history[i];
-    if (!it) return;
-    lastResult = it.data;
-    renderResult(it.data);
-    showView('studio');
-    const res = document.getElementById('results');
-    res.style.display = 'block';
-    setTimeout(() => res.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
-  }
-  function delHistory(i) {
-    S.history.splice(i, 1);
-    saveState();
-    renderCabinet();
-  }
-  function clearHistory() {
-    S.history = [];
-    saveState();
-    renderCabinet();
-    showToast(t('cleared'));
-  }
-
-  // ================= Generation Pipeline =================
-  function showErr(msg) {
-    const b = document.getElementById('errBox');
-    b.textContent = msg;
-    b.style.display = 'block';
-    haptic('error');
-  }
-  function hideErr() { document.getElementById('errBox').style.display = 'none'; }
-
-  async function postJsonWithRetry(url, body, signal) {
-    const doFetch = () => fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: signal
-    });
-    try {
-      return await doFetch();
-    } catch (e) {
-      if (e && e.name === 'AbortError') throw e;
-      await new Promise(r => setTimeout(r, 3500));
-      return await doFetch();
-    }
-  }
-
-  async function startGeneration() {
-    hideErr();
-    const q = document.getElementById('queryInp').value.trim();
-    if (!q) { showErr(t('err_query')); return; }
-    if (!S.devMode && S.balance < COST) { openNoFunds(COST); return; }
-
-    const btn = document.getElementById('submitBtn');
-    const res = document.getElementById('results');
-
-    btn.disabled = true;
-    res.style.display = 'none';
-    startAiTerminal(q);
-
-    const ctrl = new AbortController();
-    const abortTimer = setTimeout(() => ctrl.abort(), 120000);
-
-    try {
-      const resp = await postJsonWithRetry('/api/analyze', { query: q, format_type: curFmt, tone: curTone, lang: S.lang }, ctrl.signal);
-      let payload = {};
-      try { payload = await resp.json(); } catch (e) {}
-      if (!resp.ok) throw new Error(payload.detail || t('err_generic'));
-
-      if (!S.devMode) {
-        S.balance -= COST;
-        S.spent += COST;
-        addTx('gen', -COST);
-      }
-      S.gens += 1;
-      S.history.unshift({
-        id: Date.now(),
-        ts: Date.now(),
-        title: payload.product_title || q.slice(0, 40),
-        query: q.slice(0, 60),
-        data: payload
-      });
-      S.history = S.history.slice(0, 15);
-      saveState();
-      updateBalanceUI();
-
-      lastResult = payload;
-      renderResult(payload);
-      res.style.display = 'block';
-      if (payload.meta_image) loadWatermarkProductImage(payload.meta_image);
-      haptic('success');
-    } catch (e) {
-      if (e && e.name === 'AbortError') showErr(t('err_timeout'));
-      else showErr((e && e.message) || t('err_generic'));
-    } finally {
-      clearTimeout(abortTimer);
-      stopAiTerminal();
-      btn.disabled = false;
-    }
-  }
-
-  async function generateStandaloneTgPosts() {
-    const q = document.getElementById('tgQueryInp').value.trim();
-    if (!q) { showToast(t('err_query')); haptic('error'); return; }
-    if (!S.devMode && S.balance < TG_COST) { openNoFunds(TG_COST); return; }
-
-    const btn = document.getElementById('tgGenBtn');
-    const out = document.getElementById('tgPostsOutput');
-    btn.disabled = true;
-    out.innerHTML = `<div class="panel" style="text-align:center; color:var(--accent); font-family:var(--mono);">⚡ ПИШУ 3 РЕКЛАМНЫХ ПОСТА С МАРКИРОВКОЙ...</div>`;
-
-    try {
-      const resp = await postJsonWithRetry('/api/tg-post', { query: q, style: curTone, lang: S.lang });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.detail || t('err_generic'));
-
-      if (!S.devMode) {
-        S.balance -= TG_COST;
-        S.spent += TG_COST;
-        addTx('gen', -TG_COST);
-      }
-      S.gens += 1;
-      saveState();
-      updateBalanceUI();
-
-      if (data.meta_image) loadWatermarkProductImage(data.meta_image);
-      out.innerHTML = renderTgPostsCards(data.tg_posts || []);
-      haptic('success');
-    } catch (e) {
-      out.innerHTML = `<div class="err-box" style="display:block;">${esc(e.message || t('err_generic'))}</div>`;
-    } finally {
-      btn.disabled = false;
-    }
-  }
-
-  function renderTgPostsCards(posts) {
-    const footer = getEridFooterText();
-    return posts.map((p, idx) => {
-      const fullPost = `${p.headline}\n\n${p.body}\n\n${p.cta}${footer ? '\n\n' + footer : ''}`;
-      const tpIdx = regTp(`${p.headline}.\n\n${p.body}\n\n${p.cta}`);
-      const cpIdx = reg(fullPost);
-      return `
-        <div class="card">
-          <div class="card-top">
-            <div>
-              <span class="tag" style="color:var(--accent); border-color:var(--border-strong);">ПОСТ #0${idx + 1} · ${esc(p.style)}</span>
-            </div>
-            <div class="action-row">
-              <button class="prompter-btn" onclick="openTeleprompterIdx(${tpIdx})">${esc(t('prompter'))}</button>
-              <button class="copy-btn" onclick="copyIdx(${cpIdx})">${esc(t('copy'))}</button>
-            </div>
-          </div>
-          <div style="font-weight:800; font-size:14.5px; margin-bottom:6px;">${esc(p.headline)}</div>
-          <div class="tg-post-body">${esc(p.body)}</div>
-          <div style="font-weight:700; font-size:13px; color:var(--accent);">${esc(p.cta)}</div>
-          ${footer ? `<div class="erid-preview" style="display:block;">${esc(footer)}</div>` : ''}
-        </div>
-      `;
-    }).join('');
-  }
-
-  // ================= Render Studio Result =================
-  function renderResult(d) {
-    copyStore.length = 0;
-    prompterStore.length = 0;
-
-    const imgHtml = d.meta_image ? `<img class="prod-thumb" src="${esc(d.meta_image)}" alt="" onerror="this.style.display='none'">` : '';
-    const price = d.meta_price ? `<span class="tag" style="color:var(--ok);">${esc(d.meta_price)}</span>` : '';
-    document.getElementById('pHeader').innerHTML = `
-      ${imgHtml}
-      <div style="min-width:0;">
-        <div style="font-weight:800; font-size:14.5px; margin-bottom:6px;">${esc(d.product_title)}</div>
-        <div style="display:flex; gap:6px; flex-wrap:wrap;">
-          <span class="tag">${esc(d.meta_source || 'WEB')}</span>
-          <span class="tag">${esc(d.category || '')}</span>
-          ${price}
-        </div>
-      </div>`;
-
-    // 1. Scripts + Teleprompter Button
-    document.getElementById('tab-scripts').innerHTML = (d.scripts || []).map((sc, i) => {
-      const full = `${t('script')}: ${sc.title}\n${t('hook')}: ${sc.hook}\n` +
-        (sc.scenes || []).map(s => `[${s.timecode}] ${s.visual} | ${t('voice')}: ${s.voiceover}`).join('\n') +
-        `\nCTA: ${sc.cta}`;
-
-      const teleprompterVoiceText = [
-        sc.hook,
-        ...(sc.scenes || []).map(s => s.voiceover),
-        sc.cta
-      ].filter(Boolean).join('\n\n');
-
-      const tpIdx = regTp(teleprompterVoiceText);
-      const cpAllIdx = reg(full);
-
-      const scenes = (sc.scenes || []).map(s => `
-        <div class="scene-item">
-          <div class="mono" style="color:var(--accent); font-size:10.5px; margin-bottom:4px;">⏱ ${esc(s.timecode)}</div>
-          <div><strong>${esc(t('frame'))}:</strong> ${esc(s.visual)}</div>
-          <div style="margin:4px 0; color:#fff;"><strong>${esc(t('voice'))}:</strong> «${esc(s.voiceover)}»</div>
-          <div><strong>${esc(t('screen_text'))}:</strong> ${esc(s.on_screen_text)}</div>
-          <div class="prompt-box mono">
-            <span>🎥 AI: ${esc(s.ai_video_prompt)}</span>
-            <button class="copy-btn" onclick="copyIdx(${reg(s.ai_video_prompt)})">${esc(t('copy'))}</button>
-          </div>
-        </div>`).join('');
-
-      return `
-        <div class="card">
-          <div class="card-top">
-            <div style="min-width:0;">
-              <div style="font-weight:800; text-transform:uppercase;">0${i + 1} // ${esc(sc.title)}</div>
-              <div class="mono" style="font-size:10px; color:var(--muted);">${esc(sc.angle)} · <span style="color:var(--accent);">${esc(sc.virality_score)}% ${esc(t('virality'))}</span></div>
-            </div>
-            <div class="action-row">
-              <button class="prompter-btn" onclick="openTeleprompterIdx(${tpIdx})">${esc(t('prompter'))}</button>
-              <button class="copy-btn" onclick="copyIdx(${cpAllIdx})">${esc(t('copy_all'))}</button>
-            </div>
-          </div>
-          <div class="hook-box"><strong>${esc(t('hook'))}:</strong> «${esc(sc.hook)}»</div>
-          ${scenes}
-          <div style="font-size:12.5px; margin-top:8px;"><strong>CTA:</strong> ${esc(sc.cta)}</div>
-        </div>`;
-    }).join('');
-
-    // 2. TG Ad Posts inside Studio
-    const tgPosts = d.tg_posts || [];
-    document.getElementById('tab-tgposts').innerHTML = tgPosts.length
-      ? renderTgPostsCards(tgPosts)
-      : `<div class="card"><div class="empty">Перейди во вкладку «TG Посты & ERID» снизу для генерации постов с маркировкой.</div></div>`;
-
-    // 3. Hooks
-    document.getElementById('tab-hooks').innerHTML = `
-      <div class="card">
-        ${(d.viral_hooks || []).map((hk, i) => {
-          const hTpIdx = regTp(hk);
-          return `
-          <div class="list-item">
-            <div style="font-size:13px;"><strong>#0${i + 1}</strong> «${esc(hk)}»</div>
-            <div class="action-row">
-              <button class="prompter-btn" onclick="openTeleprompterIdx(${hTpIdx})">🎬</button>
-              <button class="copy-btn" onclick="copyIdx(${reg(hk)})">${esc(t('copy'))}</button>
-            </div>
-          </div>`;
-        }).join('')}
-      </div>`;
-
-    // 4. AI video prompts
-    document.getElementById('tab-prompts').innerHTML = `
-      <div class="card">
-        ${(d.video_generator_prompts || []).map(p => `
-          <div class="prompt-box mono" style="margin-bottom:8px;">
-            <span>${esc(p)}</span>
-            <button class="copy-btn" onclick="copyIdx(${reg(p)})">${esc(t('copy'))}</button>
-          </div>`).join('')}
-      </div>`;
-
-    // 5. Audience & SEO
-    const ht = (d.hashtags || []).join(' ');
-    const seoFull = `${d.seo_caption || ''}\n\n${ht}`;
-    const pains = (d.pain_points || []).map(x => `<li>${esc(x)}</li>`).join('');
-    const feats = (d.killer_features || []).map(x => `<li>${esc(x)}</li>`).join('');
-    document.getElementById('tab-seo').innerHTML = `
-      <div class="card">
-        <div class="card-top"><strong>${esc(t('audience'))}</strong></div>
-        <div style="font-size:13px;">${esc(d.target_audience)}</div>
-      </div>
-      ${pains ? `<div class="card"><div class="card-top"><strong>${esc(t('pains'))}</strong></div><ul style="font-size:13px; padding-left:18px;">${pains}</ul></div>` : ''}
-      ${feats ? `<div class="card"><div class="card-top"><strong>${esc(t('features'))}</strong></div><ul style="font-size:13px; padding-left:18px;">${feats}</ul></div>` : ''}
-      <div class="card">
-        <div class="card-top">
-          <strong>${esc(t('seo_title'))}</strong>
-          <button class="copy-btn" onclick="copyIdx(${reg(seoFull)})">${esc(t('copy_seo'))}</button>
-        </div>
-        <div style="font-size:13px; margin-bottom:8px; white-space:pre-line;">${esc(d.seo_caption)}</div>
-        <div class="mono" style="font-size:11px; color:var(--muted);">${esc(ht)}</div>
-      </div>`;
-  }
-
-  // ================= Init =================
-  updateBalanceUI();
-  applyLang();
-  drawWatermark();
-  fetch('/health').catch(() => {});
-</script>
-</body>
-</html>
-"""
-
-
-@app.get("/", response_class=HTMLResponse)
-async def serve_webapp():
-    html_out = FRONTEND_UI.replace("__ADMIN_TG_ID__", ADMIN_TG_ID)
-    return HTMLResponse(
-        content=html_out,
-        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
-    )
-
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+  function devAddCredits
