@@ -28,6 +28,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 APP_URL = os.getenv("RENDER_EXTERNAL_URL", "https://sniper-ugc.onrender.com").strip()
+APP_URL_VERSIONED = APP_URL.rstrip("/") + "/?v=4"
 
 # Main model + fallbacks (comma separated). Change in Render -> Environment.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
@@ -38,7 +39,8 @@ GEMINI_FALLBACK_MODELS = [
 ]
 
 REQUEST_TIMEOUT_MS = 45000      # timeout of one Gemini call
-TOTAL_BUDGET_SEC = 110          # total time budget for all retries
+TOTAL_BUDGET_SEC = 95           # total time budget for all retries
+KEEP_ALIVE = os.getenv("KEEP_ALIVE", "1").strip() == "1"
 MAX_OUTPUT_TOKENS = 4000
 
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
@@ -59,6 +61,50 @@ def make_ai_client():
 
 
 ai_client = make_ai_client()
+
+# ---- Auto-discovery of available Gemini models (survives model retirements) ----
+_MODEL_CACHE = {"ts": 0.0, "models": []}
+_BAD_WORDS = ("image", "tts", "audio", "live", "embed", "vision", "robotics",
+              "computer", "learnlm", "gemma", "aqa", "imagen", "veo")
+
+
+def _model_version(name: str) -> float:
+    m = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+    return float(m.group(1)) if m else 0.0
+
+
+def discover_models_sync() -> list:
+    found = []
+    for m in ai_client.models.list():
+        name = (getattr(m, "name", "") or "").replace("models/", "")
+        actions = getattr(m, "supported_actions", None) or []
+        if "flash" not in name or any(w in name for w in _BAD_WORDS):
+            continue
+        if actions and "generateContent" not in actions:
+            continue
+        found.append(name)
+    # stable first, previews last; newest version first; "lite" last
+    found.sort(key=lambda n: (("preview" in n) or ("exp" in n), -_model_version(n), "lite" in n))
+    return found
+
+
+async def get_model_candidates() -> list:
+    static = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    if not _MODEL_CACHE["models"] or now - _MODEL_CACHE["ts"] > 3600:
+        try:
+            models = await asyncio.wait_for(asyncio.to_thread(discover_models_sync), timeout=10)
+            _MODEL_CACHE["models"] = models
+            logging.info(f"Available flash models: {models[:6]}")
+        except Exception as e:
+            logging.warning(f"Model discovery failed: {e}")
+        _MODEL_CACHE["ts"] = now
+    discovered = _MODEL_CACHE["models"]
+    if discovered:
+        ordered = ([GEMINI_MODEL] if GEMINI_MODEL in discovered else []) + discovered
+        return list(dict.fromkeys(ordered))[:4]
+    return list(dict.fromkeys(static))
 
 
 class AnalyzeRequest(BaseModel):
@@ -85,7 +131,7 @@ ERR = {
         "busy": "Сервера Gemini сейчас перегружены. Подожди пару секунд и нажми ещё раз.",
         "quota": "Превышен лимит запросов к Gemini. Попробуй чуть позже.",
         "key": "Проблема с ключом Gemini API. Проверь GEMINI_API_KEY.",
-        "no_model": "Выбранная модель Gemini недоступна. Смени GEMINI_MODEL в Environment.",
+        "no_model": "Не нашлось доступной модели Gemini. Проверь GEMINI_MODEL в Environment или попробуй позже.",
         "timeout": "Генерация заняла слишком много времени. Попробуй ещё раз.",
         "short_query": "Введи ссылку, артикул или описание товара.",
         "unknown": "Неизвестная ошибка",
@@ -97,7 +143,7 @@ ERR = {
         "busy": "Gemini servers are overloaded right now. Wait a few seconds and try again.",
         "quota": "Gemini request limit exceeded. Please try again a bit later.",
         "key": "Gemini API key problem. Check GEMINI_API_KEY.",
-        "no_model": "The selected Gemini model is unavailable. Change GEMINI_MODEL in Environment.",
+        "no_model": "No available Gemini model found. Check GEMINI_MODEL in Environment or try later.",
         "timeout": "Generation took too long. Please try again.",
         "short_query": "Enter a link, SKU or product description.",
         "unknown": "Unknown error",
@@ -407,16 +453,18 @@ REQUIREMENTS: exactly 2 scripts with 3 to 4 scenes each, 5 hooks, 3 pain points,
         response_mime_type="application/json"
     )
 
-    models_to_try = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
+    models_to_try = await get_model_candidates()
     loop = asyncio.get_running_loop()
     deadline = loop.time() + TOTAL_BUDGET_SEC
-    last_error = None
+    busy_error = None
+    gone_error = None
+    bad_answer = None
     parsed = None
 
     for model_name in models_to_try:
         if parsed is not None:
             break
-        for attempt in range(2):
+        for attempt in range(3):
             if loop.time() > deadline:
                 break
             try:
@@ -430,25 +478,32 @@ REQUIREMENTS: exactly 2 scripts with 3 to 4 scenes each, 5 hooks, 3 pain points,
                 logging.info(f"Gemini OK: model={model_name}, attempt={attempt + 1}")
                 break
             except AppError as ae:
-                # empty / broken JSON -> one more attempt
-                last_error = ae
+                bad_answer = ae
                 logging.warning(f"{model_name} bad answer ({ae.code}), attempt {attempt + 1}")
                 continue
             except Exception as e:
-                last_error = e
                 msg = str(e)
                 if any(k in msg for k in GONE_MARKERS):
-                    logging.warning(f"Model {model_name} unavailable, next. {msg[:160]}")
+                    gone_error = e
+                    logging.warning(f"Model {model_name} unavailable, trying next. {msg[:160]}")
                     break
                 if any(k in msg for k in TRANSIENT_MARKERS):
+                    busy_error = e
                     logging.warning(f"{model_name} transient error (attempt {attempt + 1}): {msg[:160]}")
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(1.5 * (attempt + 1))
                     continue
                 raise
 
     if parsed is None:
-        if last_error is not None:
-            raise last_error
+        if gone_error is not None:
+            _MODEL_CACHE["ts"] = 0.0  # re-discover models on the next request
+        # the real reason matters more than "model gone" from a fallback
+        if busy_error is not None:
+            raise busy_error
+        if bad_answer is not None:
+            raise bad_answer
+        if gone_error is not None:
+            raise gone_error
         raise AppError("busy")
 
     parsed["meta_source"] = data.get("source", "Web")
@@ -518,7 +573,7 @@ def user_lang(message: types.Message) -> str:
 async def bot_start(message: types.Message):
     L = BOT_TXT[user_lang(message)]
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=L["open"], web_app=WebAppInfo(url=APP_URL))]
+        [InlineKeyboardButton(text=L["open"], web_app=WebAppInfo(url=APP_URL_VERSIONED))]
     ])
     await message.answer(L["start"], reply_markup=kb, parse_mode="HTML")
 
@@ -551,7 +606,7 @@ async def bot_quick_message(message: types.Message):
             f"📢 <b>CTA:</b> {h(str(s1.get('cta', '')))}"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=L["full"], web_app=WebAppInfo(url=APP_URL))]
+            [InlineKeyboardButton(text=L["full"], web_app=WebAppInfo(url=APP_URL_VERSIONED))]
         ])
         await wait_msg.edit_text(reply, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
@@ -565,9 +620,22 @@ async def bot_quick_message(message: types.Message):
 # =====================================================================
 # FASTAPI
 # =====================================================================
+async def keep_alive_loop():
+    """Pings our own public URL so the free Render instance does not fall asleep."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as c:
+                await c.get(APP_URL.rstrip("/") + "/health")
+        except Exception as e:
+            logging.warning(f"keep-alive ping failed: {e}")
+        await asyncio.sleep(600)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = None
+    ka_task = asyncio.create_task(keep_alive_loop()) if KEEP_ALIVE else None
     if bot:
         try:
             await bot.delete_webhook(drop_pending_updates=True)
@@ -576,6 +644,9 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logging.error(f"Polling start failed: {e}")
     yield
+    if ka_task:
+        ka_task.cancel()
+        await asyncio.gather(ka_task, return_exceptions=True)
     if task:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -1344,6 +1415,22 @@ FRONTEND_UI = r"""<!DOCTYPE html>
   }
   function hideErr() { document.getElementById('errBox').style.display = 'none'; }
 
+  async function postAnalyze(body, signal) {
+    const doFetch = () => fetch('/api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: signal
+    });
+    try {
+      return await doFetch();
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e;
+      await new Promise(r => setTimeout(r, 4000)); // server may be waking up
+      return await doFetch();
+    }
+  }
+
   async function startGeneration() {
     hideErr();
     const q = document.getElementById('queryInp').value.trim();
@@ -1370,16 +1457,11 @@ FRONTEND_UI = r"""<!DOCTYPE html>
     const abortTimer = setTimeout(() => ctrl.abort(), 125000);
 
     try {
-      const resp = await fetch('/api/analyze', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: q, format_type: curFmt, tone: curTone, lang: S.lang }),
-        signal: ctrl.signal
-      });
+      const resp = await postAnalyze({ query: q, format_type: curFmt, tone: curTone, lang: S.lang }, ctrl.signal);
 
       let payload = {};
       try { payload = await resp.json(); } catch (e) {}
-      if (!resp.ok) throw new Error(payload.detail || t('err_generic'));
+      if (!resp.ok) throw new Error(payload.detail || (resp.status >= 502 ? t('err_network') : t('err_generic')));
 
       // Success: charge credits and save to history
       S.balance -= COST;
@@ -1403,7 +1485,7 @@ FRONTEND_UI = r"""<!DOCTYPE html>
       haptic('success');
     } catch (e) {
       if (e && e.name === 'AbortError') showErr(t('err_timeout'));
-      else if (e && e.message === 'Failed to fetch') showErr(t('err_network'));
+      else if (e && /Failed to fetch|Load failed|NetworkError/i.test(e.message || '')) showErr(t('err_network'));
       else showErr((e && e.message) || t('err_generic'));
     } finally {
       clearInterval(stepTimer);
@@ -1507,6 +1589,7 @@ FRONTEND_UI = r"""<!DOCTYPE html>
   // ================= Init =================
   updateBalanceUI();
   applyLang();
+  fetch('/health').catch(() => {}); // wake the server up early
 </script>
 </body>
 </html>
@@ -1515,7 +1598,10 @@ FRONTEND_UI = r"""<!DOCTYPE html>
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_webapp():
-    return HTMLResponse(content=FRONTEND_UI)
+    return HTMLResponse(
+        content=FRONTEND_UI,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    )
 
 
 if __name__ == "__main__":
