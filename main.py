@@ -3023,4 +3023,465 @@ FRONTEND_UI = r"""<!DOCTYPE html>
   function stopPrompterScroll() {
     tpPlaying = false;
     if (tpRafId) cancelAnimationFrame(tpRafId);
-    const btn = document.getElementById('tp
+    const btn = document.getElementById('tpPlayActionBtn');
+    if (btn) btn.textContent = '▶ СТАРТ / ПРОДОЛЖИТЬ';
+  }
+
+  // ================= TG Ad Posts + ERID + Watermark =================
+  function buildEridFooter() {
+    const org = (document.getElementById('eridOrgInp')?.value || '').trim();
+    const tok = (document.getElementById('eridTokenInp')?.value || '').trim().replace(/^erid:\s*/i, '');
+    const link = (document.getElementById('eridUrlInp')?.value || '').trim();
+    const parts = [];
+    if (link) parts.push(`👉 Заказать / Артикул: ${link}`);
+    if (org || tok) {
+      parts.push(`Реклама. ${org || 'Рекламодатель'}${tok ? `, erid: ${tok}` : ''}`);
+    }
+    return parts.join('\n');
+  }
+
+  function refreshEridFooters() {
+    const footer = buildEridFooter();
+    const box = document.getElementById('eridLivePreview');
+    const tok = (document.getElementById('eridTokenInp')?.value || '').trim().replace(/^erid:\s*/i, '');
+    if (tok) document.getElementById('wmEridStampInp').value = `Реклама • erid: ${tok}`;
+    if (footer) {
+      box.style.display = 'block';
+      box.textContent = footer;
+    } else {
+      box.style.display = 'none';
+    }
+    renderWatermarkCanvas();
+  }
+
+  function renderTgPostCardsHtml(posts) {
+    const footer = buildEridFooter();
+    return (posts || []).map((p, i) => {
+      const fullTxt = `${p.headline}\n\n${p.body}\n\n${p.cta}${footer ? '\n\n' + footer : ''}`;
+      const cpIdx = saveCopyText(fullTxt);
+      const tpIdx = savePrompterText(`${p.headline}\n\n${p.body}`);
+      return `
+        <div class="bento-card">
+          <div class="script-head">
+            <span class="mini-tag neon">ПОСТ #0${i + 1} · ${esc(p.style)}</span>
+            <div style="display:flex; gap:6px;">
+              <button class="btn-chip" onclick="openPrompterWithVault(${tpIdx})">📟</button>
+              <button class="btn-chip accent" onclick="copyFromVault(${cpIdx})">📋 СКОПИРОВАТЬ ПОСТ</button>
+            </div>
+          </div>
+          <div style="font-weight:800; font-size:15px; margin-bottom:8px;">${esc(p.headline)}</div>
+          <div style="white-space:pre-line; font-size:13.5px; color:#e4e4ef; margin-bottom:10px;">${esc(p.body)}</div>
+          <div style="font-weight:700; font-size:13px; color:var(--neon);">${esc(p.cta)}</div>
+          ${footer ? `<div class="erid-tag-box">${esc(footer)}</div>` : ''}
+        </div>
+      `;
+    }).join('');
+  }
+
+  async function runStandaloneTgPosts() {
+    const q = document.getElementById('tgQueryInp').value.trim();
+    if (!q) { toast('Вставь ссылку на товар'); return; }
+    if (!S.devMode && S.balance < TG_POST_PRICE) { openCheckoutSheet(0); return; }
+
+    const btn = document.getElementById('tgGenerateBtn');
+    const out = document.getElementById('tgPostsListArea');
+    btn.disabled = true;
+    out.innerHTML = `<div class="bento-card mono" style="text-align:center; color:var(--neon);">⚡ Генерирую 3 рекламных поста по характеристикам товара...</div>`;
+
+    try {
+      const resp = await fetch('/api/tg-post', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: q, style: S.tone, lang: 'ru' })
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || 'Ошибка генерации постов');
+
+      if (!S.devMode) {
+        S.balance -= TG_POST_PRICE;
+        S.spent += TG_POST_PRICE;
+      }
+      S.gens += 1;
+      saveAppState();
+      syncHeaderAndPrices();
+
+      if (data.meta_image) loadWatermarkImageFromUrl(data.meta_image);
+      out.innerHTML = renderTgPostCardsHtml(data.tg_posts || []);
+      haptic('success');
+    } catch (e) {
+      out.innerHTML = `<div class="bento-card" style="border-color:var(--danger); color:#fda4af;">⚠️ ${esc(e.message)}</div>`;
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  // Watermark Studio
+  let wmPosition = 'br';
+  let wmLoadedImg = null;
+
+  function setWmPosition(pos, btn) {
+    wmPosition = pos;
+    btn.parentElement.querySelectorAll('.btn-chip').forEach(b => b.classList.remove('accent'));
+    btn.classList.add('accent');
+    renderWatermarkCanvas();
+  }
+
+  function loadWatermarkImageFromUrl(url) {
+    if (!url) return;
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => { wmLoadedImg = img; renderWatermarkCanvas(); };
+    img.src = '/api/proxy-image?url=' + encodeURIComponent(url);
+  }
+
+  function onCustomWatermarkFile(ev) {
+    const f = ev.target.files && ev.target.files[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = e => {
+      const img = new Image();
+      img.onload = () => { wmLoadedImg = img; renderWatermarkCanvas(); };
+      img.src = e.target.result;
+    };
+    r.readAsDataURL(f);
+  }
+
+  function renderWatermarkCanvas() {
+    const canvas = document.getElementById('wmCanvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    ctx.fillStyle = '#07070b';
+    ctx.fillRect(0, 0, W, H);
+
+    if (wmLoadedImg) {
+      const ratio = Math.max(W / wmLoadedImg.width, H / wmLoadedImg.height);
+      const nw = wmLoadedImg.width * ratio, nh = wmLoadedImg.height * ratio;
+      ctx.drawImage(wmLoadedImg, (W - nw) / 2, (H - nh) / 2, nw, nh);
+    } else {
+      ctx.strokeStyle = 'rgba(204,255,0,0.2)';
+      ctx.strokeRect(24, 24, W - 48, H - 48);
+      ctx.fillStyle = '#6b6b7b';
+      ctx.font = '600 18px Plus Jakarta Sans, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('Фото товара подгрузится из ссылки', W / 2, H / 2 - 8);
+      ctx.fillText('или нажми «📷 Загрузить фото»', W / 2, H / 2 + 20);
+    }
+
+    const handle = (document.getElementById('wmHandleInp')?.value || '').trim();
+    const erid = (document.getElementById('wmEridStampInp')?.value || '').trim();
+
+    if (handle) {
+      ctx.save();
+      if (wmPosition === 'center') {
+        ctx.translate(W / 2, H / 2);
+        ctx.rotate(-Math.PI / 6);
+        ctx.font = '800 40px Syne, sans-serif';
+        ctx.fillStyle = 'rgba(255,255,255,0.28)';
+        ctx.textAlign = 'center';
+        ctx.fillText(handle, 0, 0);
+      } else {
+        ctx.font = '700 20px Plus Jakarta Sans, sans-serif';
+        const tw = ctx.measureText(handle).width;
+        const bw = tw + 32, bh = 38;
+        let bx = W - bw - 20, by = H - bh - 20;
+        if (wmPosition === 'bl') bx = 20;
+        if (wmPosition === 'tl') { bx = 20; by = 20; }
+        ctx.fillStyle = 'rgba(5,5,8,0.78)';
+        ctx.beginPath();
+        ctx.roundRect(bx, by, bw, bh, 10);
+        ctx.fill();
+        ctx.fillStyle = '#ccff00';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(handle, bx + 16, by + bh / 2);
+      }
+      ctx.restore();
+    }
+
+    if (erid) {
+      ctx.save();
+      ctx.font = '600 14px JetBrains Mono, monospace';
+      const tw = ctx.measureText(erid).width;
+      const bw = tw + 20, bh = 28;
+      const bx = 20, by = H - bh - (wmPosition === 'bl' ? 68 : 20);
+      ctx.fillStyle = 'rgba(0,0,0,0.8)';
+      ctx.beginPath();
+      ctx.roundRect(bx, by, bw, bh, 7);
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(erid, bx + 10, by + bh / 2);
+      ctx.restore();
+    }
+  }
+
+  function downloadWatermarkPng() {
+    const canvas = document.getElementById('wmCanvas');
+    const a = document.createElement('a');
+    a.href = canvas.toDataURL('image/png');
+    a.download = 'sniper_ugc_product.png';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    toast('Фото скачано');
+  }
+
+  // ================= Cabinet & Multi-Method Demo Checkout (Stars / SBP / Crypto) =================
+  let activePayMethod = 'stars'; // stars, sbp, crypto
+  let selectedPackIdx = 1;
+
+  function renderCabinetView() {
+    const name = tgUser ? ([tgUser.first_name, tgUser.last_name].filter(Boolean).join(' ') || tgUser.username || 'Креатор') : 'Креатор';
+    const sub = tgUser && tgUser.username ? '@' + tgUser.username : 'SNIPER STUDIO PRO';
+    const badge = S.devMode
+      ? `<span class="mini-tag neon">⚡ OWNER // DEV MODE</span>`
+      : `<span class="mini-tag">PRO КРЕАТОР</span>`;
+
+    document.getElementById('cabProfileHeader').innerHTML = `
+      <div class="brand-mark" style="width:46px; height:46px; font-size:16px; border-radius:50%;">${esc(name.charAt(0).toUpperCase())}</div>
+      <div style="min-width:0;">
+        <div style="font-weight:800; font-size:16px;">${esc(name)}</div>
+        <div style="display:flex; gap:6px; align-items:center; margin-top:3px;">
+          <span style="font-size:12px; color:var(--muted);">${esc(sub)}</span>
+          ${badge}
+        </div>
+      </div>
+    `;
+
+    document.getElementById('ownerDevConsole').style.display = S.devMode ? 'block' : 'none';
+    document.getElementById('cabBigBalance').textContent = S.devMode ? '∞ DEV' : `${S.balance} ★`;
+
+    document.getElementById('cabPackCards').innerHTML = PACKAGES.map((p, i) => `
+      <div onclick="openCheckoutSheet(${i})" style="background:#07070b; border:1.5px solid ${p.hot ? 'var(--neon)' : 'var(--border-light)'}; border-radius:14px; padding:11px 6px; text-align:center; cursor:pointer;">
+        <div class="mono" style="font-size:9px; color:${p.hot ? 'var(--neon)' : 'var(--muted)'}; margin-bottom:3px;">${esc(p.tag)}</div>
+        <div style="font-family:var(--display); font-size:18px; font-weight:800;">+${p.credits} ★</div>
+        <div style="font-size:11px; color:var(--muted); margin-top:2px;">${esc(p.rub)}</div>
+      </div>
+    `).join('');
+
+    const histBox = document.getElementById('cabHistoryContainer');
+    if (!S.history.length) {
+      histBox.innerHTML = `<div style="color:var(--muted); font-size:12.5px; text-align:center; padding:12px;">История пока пуста</div>`;
+    } else {
+      histBox.innerHTML = S.history.map((it, idx) => `
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding:10px 0; border-bottom:1px solid var(--border);">
+          <div style="min-width:0;">
+            <div style="font-weight:700; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${esc(it.title)}</div>
+            <div class="mono" style="font-size:10.5px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${esc(it.query)}</div>
+          </div>
+          <button class="btn-chip accent" onclick="loadHistoryProject(${idx})">Открыть</button>
+        </div>
+      `).join('');
+    }
+  }
+
+  function loadHistoryProject(idx) {
+    const item = S.history[idx];
+    if (!item) return;
+    lastResultData = item.data;
+    renderStudioResults(item.data);
+    switchView('studio');
+    document.getElementById('resultsArea').style.display = 'block';
+  }
+
+  function wipeHistory() {
+    S.history = [];
+    saveAppState();
+    renderCabinetView();
+    toast('История очищена');
+  }
+
+  function openCheckoutSheet(packIdx) {
+    if (typeof packIdx === 'number') selectedPackIdx = packIdx;
+    const p = PACKAGES[selectedPackIdx] || PACKAGES[1];
+
+    const packRow = PACKAGES.map((pk, idx) => `
+      <button type="button" onclick="openCheckoutSheet(${idx})" style="flex:1; background:${idx === selectedPackIdx ? 'var(--neon-soft)' : '#07070b'}; border:1.5px solid ${idx === selectedPackIdx ? 'var(--neon)' : 'var(--border)'}; color:var(--text); border-radius:11px; padding:8px 4px; cursor:pointer;">
+        <div style="font-weight:800; font-size:13px;">+${pk.credits} ★</div>
+        <div class="mono" style="font-size:10px; color:var(--muted);">${activePayMethod === 'stars' ? pk.stars + ' ★' : (activePayMethod === 'sbp' ? pk.rub : pk.usdt)}</div>
+      </button>
+    `).join('');
+
+    let methodBody = '';
+    if (activePayMethod === 'stars') {
+      methodBody = `
+        <div style="background:#07070b; border:1px solid var(--border); border-radius:14px; padding:14px; margin-bottom:14px;">
+          <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+            <span style="color:var(--muted);">К зачислению:</span>
+            <strong style="color:var(--neon);">+${p.credits} ★</strong>
+          </div>
+          <div style="display:flex; justify-content:space-between;">
+            <span style="color:var(--muted);">Сумма списания:</span>
+            <strong>${p.stars} Telegram Stars</strong>
+          </div>
+        </div>
+        <button id="starsPayExecBtn" class="btn-primary" onclick="executeTelegramStarsPayment(${selectedPackIdx})">
+          ⭐ ОПЛАТИТЬ ${p.stars} STARS
+        </button>
+      `;
+    } else if (activePayMethod === 'sbp') {
+      methodBody = `
+        <div style="background:#07070b; border:1px solid var(--border); border-radius:14px; padding:14px; margin-bottom:14px; text-align:center;">
+          <div class="mono" style="font-size:10.5px; color:var(--neon); margin-bottom:4px;">СБП БЫСТРЫЙ ПЛАТЁЖ · КАРТЫ РФ (МИР)</div>
+          <div style="font-size:18px; font-weight:800; margin-bottom:6px;">К оплате: ${esc(p.rub)} за +${p.credits} ★</div>
+          <div class="qr-mock">
+            <svg viewBox="0 0 100 100" width="124" height="124">
+              <rect width="30" height="30" x="5" y="5" fill="#000"/><rect width="18" height="18" x="11" y="11" fill="#fff"/><rect width="10" height="10" x="15" y="15" fill="#000"/>
+              <rect width="30" height="30" x="65" y="5" fill="#000"/><rect width="18" height="18" x="71" y="11" fill="#fff"/><rect width="10" height="10" x="75" y="15" fill="#000"/>
+              <rect width="30" height="30" x="5" y="65" fill="#000"/><rect width="18" height="18" x="11" y="71" fill="#fff"/><rect width="10" height="10" x="15" y="75" fill="#000"/>
+              <rect width="12" height="12" x="44" y="12" fill="#000"/><rect width="12" height="24" x="44" y="36" fill="#000"/><rect width="20" height="12" x="64" y="48" fill="#000"/><rect width="24" height="16" x="48" y="74" fill="#000"/>
+            </svg>
+          </div>
+          <div style="font-size:11.5px; color:var(--muted);">Демо-шлюз СБП: нажми кнопку ниже для мгновенного тестового зачисления</div>
+        </div>
+        <button class="btn-primary" onclick="completeDemoPayment(${p.credits}, 'СБП / Карта РФ')">
+          ⚡ ПОДТВЕРДИТЬ ОПЛАТУ СБП (${esc(p.rub)})
+        </button>
+      `;
+    } else {
+      methodBody = `
+        <div style="background:#07070b; border:1px solid var(--border); border-radius:14px; padding:14px; margin-bottom:14px;">
+          <div class="mono" style="font-size:10.5px; color:var(--neon); margin-bottom:6px;">USDT (TRC-20 / TON) · CRYPTO PAY</div>
+          <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+            <span style="color:var(--muted);">Сумма к переводу:</span>
+            <strong style="color:var(--neon);">${esc(p.usdt)} (+${p.credits} ★)</strong>
+          </div>
+          <div class="mono" style="font-size:11px; background:var(--card); padding:9px; border-radius:8px; border:1px solid var(--border-light); word-break:break-all; margin-bottom:8px;">
+            TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE
+          </div>
+          <div style="font-size:11.5px; color:var(--muted);">Демо-режим крипто-кассы: средства зачисляются по кнопке проверки транзакции</div>
+        </div>
+        <button class="btn-primary" onclick="completeDemoPayment(${p.credits}, 'USDT Crypto')">
+          💎 Я ОПЛАТИЛ — ПРОВЕРИТЬ ТРАНЗАКЦИЮ
+        </button>
+      `;
+    }
+
+    openSheet(`
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+        <div style="font-weight:800; font-size:17px;">Пополнение баланса</div>
+        <button class="btn-chip" onclick="closeSheet()">✕</button>
+      </div>
+
+      <div class="pay-methods">
+        <button type="button" class="pm-btn ${activePayMethod === 'stars' ? 'active' : ''}" onclick="switchPayMethod('stars')">★ TG Stars</button>
+        <button type="button" class="pm-btn ${activePayMethod === 'sbp' ? 'active' : ''}" onclick="switchPayMethod('sbp')">💳 СБП / РФ</button>
+        <button type="button" class="pm-btn ${activePayMethod === 'crypto' ? 'active' : ''}" onclick="switchPayMethod('crypto')">💎 USDT / TON</button>
+      </div>
+
+      <div style="display:flex; gap:6px; margin-bottom:14px;">${packRow}</div>
+      ${methodBody}
+
+      <div style="text-align:center; margin-top:12px;">
+        <button type="button" style="background:none; border:none; color:var(--muted); font-size:12px; cursor:pointer; text-decoration:underline;" onclick="openSupportChat()">
+          Вопросы по оплате? Саппорт @onadash
+        </button>
+      </div>
+    `);
+  }
+
+  function switchPayMethod(m) {
+    activePayMethod = m;
+    openCheckoutSheet(selectedPackIdx);
+  }
+
+  function completeDemoPayment(credits, label) {
+    S.balance += credits;
+    saveAppState();
+    syncHeaderAndPrices();
+    renderCabinetView();
+    closeSheet();
+    toast(`✅ +${credits} ★ зачислено (${label})`);
+    haptic('success');
+  }
+
+  async function executeTelegramStarsPayment(idx) {
+    const p = PACKAGES[idx];
+    if (!p) return;
+    const btn = document.getElementById('starsPayExecBtn');
+    if (btn) { btn.disabled = true; btn.textContent = 'СОЗДАЁМ СЧЁТ...'; }
+    try {
+      const resp = await fetch('/api/create-stars-invoice', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          pack_id: p.id,
+          user_id: (tgUser && tgUser.id) ? tgUser.id : 0,
+          lang: 'ru'
+        })
+      });
+      const data = await resp.json();
+      if (!resp.ok || !data.invoice_link) throw new Error(data.detail || 'Ошибка создания счёта');
+
+      if (tg && tg.openInvoice) {
+        tg.openInvoice(data.invoice_link, function(status) {
+          if (status === 'paid') {
+            completeDemoPayment(p.credits, 'Telegram Stars');
+          } else if (btn) {
+            btn.disabled = false;
+            btn.textContent = `⭐ ОПЛАТИТЬ ${p.stars} STARS`;
+          }
+        });
+      } else {
+        window.open(data.invoice_link, '_blank');
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = `⭐ ОПЛАТИТЬ ${p.stars} STARS`;
+        }
+      }
+    } catch (e) {
+      toast(e.message || 'Ошибка оплаты');
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = `⭐ ОПЛАТИТЬ ${p.stars} STARS`;
+      }
+    }
+  }
+
+  function redeemPromoCode() {
+    const inp = document.getElementById('promoCodeInp');
+    const code = (inp.value || '').trim().toUpperCase();
+    if (!code) return;
+    if (code === 'DEVMODE' || code === 'DEVELOPER') {
+      inp.value = '';
+      setDevModeState(true);
+      return;
+    }
+    if (S.promoUsed) { toast('Промокод уже был активирован'); haptic('error'); return; }
+    const bonus = PROMOS[code];
+    if (!bonus) { toast('Промокод не найден'); haptic('error'); return; }
+    S.promoUsed = true;
+    S.balance += bonus;
+    saveAppState();
+    syncHeaderAndPrices();
+    renderCabinetView();
+    inp.value = '';
+    toast(`🎁 Промокод активирован: +${bonus} ★`);
+    haptic('success');
+  }
+
+  // ================= Boot =================
+  syncHeaderAndPrices();
+  renderWatermarkCanvas();
+  fetch('/health').catch(() => {});
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_webapp():
+    html_out = FRONTEND_UI.replace("__ADMIN_TG_ID__", ADMIN_TG_ID)
+    return HTMLResponse(
+        content=html_out,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
