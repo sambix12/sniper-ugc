@@ -2044,4 +2044,1101 @@ FRONTEND_UI = r"""<!DOCTYPE html>
     haptic('success');
   }
 
-  function devAddCredits
+  function devAddCredits(amount) {
+    S.balance += amount;
+    addTx('topup', amount);
+    saveState();
+    updateBalanceUI();
+    renderCabinet();
+    showToast(`+${amount} ★ начислено (DEV)!`);
+    haptic('success');
+  }
+
+  // ================= Helpers =================
+  let curFmt = 'ugc';
+  let curTone = 'native';
+  let lastResult = null;
+  let currentProductPreview = null;
+  const copyStore = [];
+  const prompterStore = [];
+
+  function esc(s) {
+    if (s === null || s === undefined) return '';
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+  function reg(txt) { copyStore.push(txt == null ? '' : String(txt)); return copyStore.length - 1; }
+  function copyIdx(i) { copy(copyStore[i]); }
+  function regTp(txt) { prompterStore.push(txt == null ? '' : String(txt)); return prompterStore.length - 1; }
+
+  let toastTimer = null;
+  function showToast(text) {
+    const el = document.getElementById('toast');
+    el.textContent = text;
+    el.style.display = 'block';
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.style.display = 'none'; }, 1900);
+  }
+  function haptic(kind) {
+    try { if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred(kind || 'success'); } catch (e) {}
+  }
+  function fallbackCopy(txt) {
+    const ta = document.createElement('textarea');
+    ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+  }
+  function copy(txt) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(txt).catch(() => fallbackCopy(txt));
+    } else {
+      fallbackCopy(txt);
+    }
+    showToast(t('copied'));
+    haptic('success');
+  }
+  function fmtDate(ts) {
+    try {
+      return new Date(ts).toLocaleString(S.lang === 'ru' ? 'ru-RU' : 'en-US', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+    } catch (e) { return ''; }
+  }
+
+  // ================= Smart Input & Live Product Overview =================
+  let previewTimers = {};
+  function onSmartInput(el, mode) {
+    const val = (el.value || '').trim();
+    const clearBtn = document.getElementById(mode === 'main' ? 'clearMainBtn' : 'clearTgBtn');
+    if (clearBtn) clearBtn.style.display = val.length > 0 ? 'flex' : 'none';
+
+    const otherId = mode === 'main' ? 'tgQueryInp' : 'queryInp';
+    const otherEl = document.getElementById(otherId);
+    if (otherEl && !otherEl.value.trim()) otherEl.value = val;
+
+    clearTimeout(previewTimers[mode]);
+    const box = document.getElementById(mode === 'main' ? 'livePreviewMain' : 'livePreviewTg');
+    if (val.length < 5) {
+      if (box) box.style.display = 'none';
+      return;
+    }
+
+    previewTimers[mode] = setTimeout(() => fetchLivePreview(val, mode), 400);
+  }
+
+  async function pasteClipboard(inputId, mode) {
+    const el = document.getElementById(inputId);
+    try {
+      if (navigator.clipboard && navigator.clipboard.readText) {
+        const txt = await navigator.clipboard.readText();
+        if (txt) {
+          el.value = txt.trim();
+          onSmartInput(el, mode);
+          haptic('success');
+          return;
+        }
+      }
+    } catch (e) {}
+    el.focus();
+  }
+
+  function clearSmartInput(inputId, mode) {
+    const el = document.getElementById(inputId);
+    el.value = '';
+    onSmartInput(el, mode);
+    const box = document.getElementById(mode === 'main' ? 'livePreviewMain' : 'livePreviewTg');
+    if (box) box.style.display = 'none';
+  }
+
+  async function fetchLivePreview(query, mode) {
+    const box = document.getElementById(mode === 'main' ? 'livePreviewMain' : 'livePreviewTg');
+    if (!box) return;
+    try {
+      const resp = await fetch('/api/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: query })
+      });
+      if (!resp.ok) return;
+      const d = await resp.json();
+      currentProductPreview = d;
+
+      const img = d.image ? `<img class="lp-thumb" src="${esc(d.image)}" alt="" onerror="this.style.display='none'">` : '';
+      const price = d.price ? `<span class="lp-price">${esc(d.price)}</span>` : '';
+      const brand = d.brand ? ` · ${esc(d.brand)}` : '';
+      const cat = d.category ? `${esc(d.category)}` : 'Готово к генерации';
+
+      box.innerHTML = `
+        <div class="lp-inner">
+          ${img}
+          <div class="lp-body">
+            <div class="lp-badges">
+              <span class="lp-badge">✓ ${esc(d.source || 'НАЙДЕНО')}</span>
+              ${price}
+            </div>
+            <div class="lp-title">${esc(d.title)}</div>
+            <div class="lp-sub">${cat}${brand}</div>
+          </div>
+        </div>
+      `;
+      box.style.display = 'block';
+      if (d.image) loadWatermarkProductImage(d.image);
+    } catch (e) {}
+  }
+
+  // ================= AI Live Terminal Animation =================
+  let termInterval = null;
+  function startAiTerminal(queryText) {
+    const term = document.getElementById('aiTerminal');
+    const bar = document.getElementById('termBar');
+    const pct = document.getElementById('termPercent');
+    const stream = document.getElementById('termStream');
+    term.style.display = 'block';
+    stream.innerHTML = '';
+
+    const pTitle = (currentProductPreview && currentProductPreview.title) ? currentProductPreview.title : queryText.slice(0, 42);
+    const pSource = (currentProductPreview && currentProductPreview.source) ? currentProductPreview.source : 'Web Source';
+    const pPrice = (currentProductPreview && currentProductPreview.price) ? ` (${currentProductPreview.price})` : '';
+
+    const logSteps = S.lang === 'ru' ? [
+      { p: 16, txt: `Подключение к ${pSource}: «${pTitle}»${pPrice}` },
+      { p: 34, txt: `Анализ карточки: выделение болей ЦА и триггеров покупки...` },
+      { p: 54, txt: `AI-продюсер: генерация 5 хуков с высоким удержанием (0-2 сек)...` },
+      { p: 74, txt: `Сборка раскадровки, текста для телесуфлёра и AI видео-промптов...` },
+      { p: 90, txt: `Подготовка модуля быстрого рерайта и 3 нативных TG-постов...` },
+      { p: 97, txt: `Финальная упаковка студии...` }
+    ] : [
+      { p: 16, txt: `Connected to ${pSource}: "${pTitle}"${pPrice}` },
+      { p: 34, txt: `Analyzing product specs, USP and audience pain points...` },
+      { p: 54, txt: `AI Producer: crafting 5 scroll-stopping hooks (0-2s)...` },
+      { p: 74, txt: `Building scene-by-scene storyboard & teleprompter voiceover...` },
+      { p: 90, txt: `Preparing 1-tap AI Rewrite engine & 3 Telegram ad posts...` },
+      { p: 97, txt: `Finalizing studio package...` }
+    ];
+
+    let idx = 0;
+    function pushStep() {
+      if (idx >= logSteps.length) return;
+      const item = logSteps[idx];
+      bar.style.width = item.p + '%';
+      pct.textContent = `AI ENGINE // ${item.p}%`;
+
+      const prevCursor = stream.querySelector('.term-cursor');
+      if (prevCursor) prevCursor.remove();
+
+      const line = document.createElement('div');
+      line.className = 'term-line';
+      line.innerHTML = `<span class="ok">▸</span><span>${esc(item.txt)}<span class="term-cursor"></span></span>`;
+      stream.appendChild(line);
+      stream.scrollTop = stream.scrollHeight;
+      idx++;
+    }
+
+    pushStep();
+    clearInterval(termInterval);
+    termInterval = setInterval(pushStep, 2200);
+  }
+
+  function stopAiTerminal() {
+    clearInterval(termInterval);
+    const term = document.getElementById('aiTerminal');
+    if (term) term.style.display = 'none';
+  }
+
+  // ================= Views & Tabs =================
+  function showView(name) {
+    ['studio', 'tgads', 'cabinet'].forEach(v => {
+      document.getElementById('view-' + v).classList.toggle('active', v === name);
+      document.getElementById('nav-' + v).classList.toggle('active', v === name);
+    });
+    if (name === 'cabinet') renderCabinet();
+    if (name === 'tgads') drawWatermark();
+    window.scrollTo(0, 0);
+  }
+  function setTab(name, btn) {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('tab-' + name).classList.add('active');
+  }
+  function bindChips(id, cb) {
+    document.querySelectorAll('#' + id + ' .chip').forEach(c => {
+      c.onclick = () => {
+        document.querySelectorAll('#' + id + ' .chip').forEach(x => x.classList.remove('active'));
+        c.classList.add('active');
+        cb(c.dataset.v);
+      };
+    });
+  }
+  bindChips('fmtChips', v => { curFmt = v; });
+  bindChips('toneChips', v => { curTone = v; });
+
+  function setLang(l) {
+    if (!I18N[l]) return;
+    S.lang = l;
+    saveState();
+    applyLang();
+  }
+  function applyLang() {
+    document.documentElement.lang = S.lang;
+    document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = t(el.dataset.i18n); });
+    document.querySelectorAll('[data-i18n-ph]').forEach(el => { el.placeholder = t(el.dataset.i18nPh); });
+    document.querySelectorAll('.lang-sw button').forEach(b => b.classList.toggle('active', b.dataset.l === S.lang));
+    document.getElementById('costNote').textContent = S.devMode ? t('cost_dev') : t('cost', { n: COST });
+    const scBadge = document.getElementById('scriptCostBtnBadge');
+    if (scBadge) scBadge.textContent = S.devMode ? '(DEV ∞)' : `(${COST} ★)`;
+    const tgCostLbl = document.getElementById('tgCostLabel');
+    if (tgCostLbl) tgCostLbl.textContent = S.devMode ? '(DEV ∞)' : `(${TG_COST} ★)`;
+    renderCabinet();
+    if (lastResult) renderResult(lastResult);
+  }
+
+  // ================= 1-Tap AI Script Rewrite Engine =================
+  function toggleCustomRewriteBox(idx) {
+    const box = document.getElementById('rwCustomBox-' + idx);
+    if (!box) return;
+    box.classList.toggle('open');
+    if (box.classList.contains('open')) {
+      const inp = document.getElementById('rwCustomInp-' + idx);
+      if (inp) inp.focus();
+    }
+  }
+
+  async function runScriptRewrite(idx, action) {
+    if (!lastResult || !lastResult.scripts || !lastResult.scripts[idx]) return;
+    const sc = lastResult.scripts[idx];
+    let customText = '';
+    if (action === 'custom') {
+      const inp = document.getElementById('rwCustomInp-' + idx);
+      customText = (inp && inp.value) ? inp.value.trim() : '';
+      if (!customText) {
+        showToast('Напиши, что именно нужно изменить');
+        return;
+      }
+    }
+
+    const statusEl = document.getElementById('rwStatus-' + idx);
+    if (statusEl) {
+      statusEl.style.display = 'block';
+      statusEl.textContent = t('rw_loading');
+    }
+    haptic('warning');
+
+    try {
+      const resp = await fetch('/api/rewrite-script', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          product_title: lastResult.product_title || '',
+          script: sc,
+          action: action,
+          custom_instruction: customText,
+          lang: S.lang
+        })
+      });
+      const data = await resp.json();
+      if (!resp.ok || !data.script) {
+        throw new Error(data.detail || t('err_generic'));
+      }
+
+      lastResult.scripts[idx] = data.script;
+      if (S.history.length > 0 && S.history[0].data) {
+        S.history[0].data = lastResult;
+        saveState();
+      }
+      renderResult(lastResult);
+      showToast('✨ Сценарий обновлён!');
+      haptic('success');
+    } catch (e) {
+      showToast(e.message || t('err_generic'));
+      if (statusEl) statusEl.style.display = 'none';
+    }
+  }
+
+  // ================= Teleprompter Studio =================
+  let tpPlaying = false;
+  let tpSpeed = 1.2;
+  let tpFontSize = 28;
+  let tpMirror = false;
+  let tpRaf = null;
+  let tpLastTs = 0;
+
+  function openTeleprompterIdx(idx) {
+    const text = prompterStore[idx] || '';
+    openTeleprompterText(text);
+  }
+
+  function openTeleprompterText(text) {
+    stopTeleprompterScroll();
+    const modal = document.getElementById('teleprompterModal');
+    const txtEl = document.getElementById('tpText');
+    const stage = document.getElementById('tpStage');
+    txtEl.textContent = text;
+    txtEl.style.fontSize = tpFontSize + 'px';
+    stage.scrollTop = 0;
+    modal.classList.add('open');
+    haptic('success');
+  }
+
+  function closeTeleprompter() {
+    stopTeleprompterScroll();
+    document.getElementById('teleprompterModal').classList.remove('open');
+  }
+
+  function resetTeleprompter() {
+    stopTeleprompterScroll();
+    document.getElementById('tpStage').scrollTop = 0;
+  }
+
+  function toggleTpMirror() {
+    tpMirror = !tpMirror;
+    document.getElementById('tpStage').classList.toggle('mirror', tpMirror);
+    document.getElementById('tpMirrorBtn').style.borderColor = tpMirror ? 'var(--accent)' : 'var(--border)';
+  }
+
+  function onTpSpeedChange(val) {
+    tpSpeed = parseFloat(val) || 1.2;
+    document.getElementById('tpSpeedVal').textContent = tpSpeed.toFixed(1) + 'x';
+  }
+
+  function changeTpFont(delta) {
+    tpFontSize = Math.min(46, Math.max(18, tpFontSize + delta));
+    document.getElementById('tpText').style.fontSize = tpFontSize + 'px';
+  }
+
+  function startTpWithCountdown() {
+    if (tpPlaying) {
+      stopTeleprompterScroll();
+      return;
+    }
+    const cd = document.getElementById('tpCountdown');
+    let count = 3;
+    cd.textContent = count;
+    cd.style.display = 'flex';
+    const iv = setInterval(() => {
+      count--;
+      if (count > 0) {
+        cd.textContent = count;
+        haptic('warning');
+      } else {
+        clearInterval(iv);
+        cd.style.display = 'none';
+        startTeleprompterScroll();
+      }
+    }, 850);
+  }
+
+  function toggleTeleprompterPlay() {
+    if (document.activeElement === document.getElementById('tpText')) return;
+    if (tpPlaying) stopTeleprompterScroll();
+    else startTeleprompterScroll();
+  }
+
+  function startTeleprompterScroll() {
+    tpPlaying = true;
+    tpLastTs = performance.now();
+    const btn = document.getElementById('tpPlayBtn');
+    btn.textContent = '⏸ ПАУЗА (ТАП ПО ЭКРАНУ)';
+    btn.classList.add('ghost');
+
+    const stage = document.getElementById('tpStage');
+    function step(now) {
+      if (!tpPlaying) return;
+      const dt = (now - tpLastTs) / 1000;
+      tpLastTs = now;
+      stage.scrollTop += (38 * tpSpeed) * dt;
+      if (stage.scrollTop + stage.clientHeight >= stage.scrollHeight - 4) {
+        stopTeleprompterScroll();
+        return;
+      }
+      tpRaf = requestAnimationFrame(step);
+    }
+    tpRaf = requestAnimationFrame(step);
+  }
+
+  function stopTeleprompterScroll() {
+    tpPlaying = false;
+    if (tpRaf) cancelAnimationFrame(tpRaf);
+    const btn = document.getElementById('tpPlayBtn');
+    if (btn) {
+      btn.textContent = '▶ ПРОДОЛЖИТЬ ЗАПИСЬ';
+      btn.classList.remove('ghost');
+    }
+  }
+
+  // ================= ERID & Watermark Studio =================
+  function getEridFooterText() {
+    const org = (document.getElementById('eridOrgInp')?.value || '').trim();
+    const tok = (document.getElementById('eridTokenInp')?.value || '').trim();
+    const link = (document.getElementById('eridLinkInp')?.value || '').trim();
+    let lines = [];
+    if (link) lines.push(`👉 Ссылка / Артикул: ${link}`);
+    if (org || tok) {
+      const cleanTok = tok.replace(/^erid:\s*/i, '');
+      lines.push(`Реклама. ${org || 'Рекламодатель'}${cleanTok ? `, erid: ${cleanTok}` : ''}`);
+    }
+    return lines.join('\n');
+  }
+
+  function updateEridPreview() {
+    const footer = getEridFooterText();
+    const box = document.getElementById('eridLiveBox');
+    const wmErid = document.getElementById('wmEridInp');
+    const tok = (document.getElementById('eridTokenInp')?.value || '').trim().replace(/^erid:\s*/i, '');
+    if (wmErid && tok) wmErid.value = `Реклама • erid: ${tok}`;
+
+    if (footer) {
+      box.style.display = 'block';
+      box.textContent = footer;
+    } else {
+      box.style.display = 'none';
+    }
+    drawWatermark();
+  }
+
+  let wmPos = 'br';
+  let wmBaseImg = null;
+
+  function setWmPos(pos, btn) {
+    wmPos = pos;
+    document.querySelectorAll('#wmPosChips .chip').forEach(c => c.classList.remove('active'));
+    btn.classList.add('active');
+    drawWatermark();
+  }
+
+  function loadWatermarkProductImage(url) {
+    if (!url) return;
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => { wmBaseImg = img; drawWatermark(); };
+    img.src = '/api/proxy-image?url=' + encodeURIComponent(url);
+  }
+
+  function uploadCustomWmImage(ev) {
+    const file = ev.target.files && ev.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = e => {
+      const img = new Image();
+      img.onload = () => { wmBaseImg = img; drawWatermark(); };
+      img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function drawWatermark() {
+    const canvas = document.getElementById('wmCanvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width;
+    const H = canvas.height;
+
+    ctx.fillStyle = '#0c0c12';
+    ctx.fillRect(0, 0, W, H);
+
+    if (wmBaseImg) {
+      const ratio = Math.max(W / wmBaseImg.width, H / wmBaseImg.height);
+      const nw = wmBaseImg.width * ratio;
+      const nh = wmBaseImg.height * ratio;
+      ctx.drawImage(wmBaseImg, (W - nw) / 2, (H - nh) / 2, nw, nh);
+    } else {
+      ctx.strokeStyle = 'rgba(212,255,58,0.18)';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(24, 24, W - 48, H - 48);
+      ctx.fillStyle = '#666677';
+      ctx.font = '600 18px Manrope, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('Фото товара подгрузится по ссылке', W / 2, H / 2 - 10);
+      ctx.fillText('или нажми «📷 Своё фото» ниже', W / 2, H / 2 + 20);
+    }
+
+    const wmText = (document.getElementById('wmTextInp')?.value || '').trim();
+    const eridText = (document.getElementById('wmEridInp')?.value || '').trim();
+
+    if (wmText) {
+      ctx.save();
+      if (wmPos === 'center') {
+        ctx.translate(W / 2, H / 2);
+        ctx.rotate(-Math.PI / 6);
+        ctx.font = '800 38px Unbounded, sans-serif';
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.28)';
+        ctx.textAlign = 'center';
+        ctx.fillText(wmText, 0, 0);
+      } else {
+        ctx.font = '700 20px Manrope, sans-serif';
+        const padX = 16, tw = ctx.measureText(wmText).width;
+        const bw = tw + padX * 2, bh = 38;
+        let bx = W - bw - 20, by = H - bh - 20;
+        if (wmPos === 'bl') bx = 20;
+        if (wmPos === 'tl') { bx = 20; by = 20; }
+
+        ctx.fillStyle = 'rgba(7, 7, 10, 0.75)';
+        ctx.beginPath();
+        ctx.roundRect(bx, by, bw, bh, 10);
+        ctx.fill();
+
+        ctx.fillStyle = '#d4ff3a';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(wmText, bx + padX, by + bh / 2);
+      }
+      ctx.restore();
+    }
+
+    if (eridText) {
+      ctx.save();
+      ctx.font = '600 14px JetBrains Mono, monospace';
+      const tw = ctx.measureText(eridText).width;
+      const bw = tw + 20, bh = 28;
+      const bx = 20, by = H - bh - (wmPos === 'bl' ? 68 : 20);
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.78)';
+      ctx.beginPath();
+      ctx.roundRect(bx, by, bw, bh, 7);
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(eridText, bx + 10, by + bh / 2);
+      ctx.restore();
+    }
+  }
+
+  function downloadWatermarkedImage() {
+    const canvas = document.getElementById('wmCanvas');
+    const url = canvas.toDataURL('image/png');
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'sniper_ugc_post.png';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    showToast('Фото сохранено!');
+    haptic('success');
+  }
+
+  // ================= Modal & Telegram Stars Payment =================
+  function openModal(html) {
+    document.getElementById('sheet').innerHTML = html;
+    document.getElementById('overlay').classList.add('open');
+  }
+  function closeModal() {
+    document.getElementById('overlay').classList.remove('open');
+  }
+  function updateBalanceUI() {
+    const devTop = document.getElementById('devTopBadge');
+    const normSub = document.getElementById('normalStudioSub');
+    const devCard = document.getElementById('devConsoleCard');
+    if (devTop) devTop.classList.toggle('active', !!S.devMode);
+    if (normSub) normSub.style.display = S.devMode ? 'none' : 'inline-block';
+    if (devCard) devCard.classList.toggle('active', !!S.devMode);
+
+    document.getElementById('balChip').textContent = S.devMode ? '∞ DEV' : S.balance;
+    const cb = document.getElementById('cabBalance');
+    if (cb) cb.textContent = S.devMode ? '∞' : S.balance;
+  }
+  function addTx(type, amount) {
+    S.tx.unshift({ type: type, amount: amount, ts: Date.now() });
+    S.tx = S.tx.slice(0, 40);
+  }
+  function scrollToTopup() {
+    const el = document.getElementById('topupSec');
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  function openPay(i) {
+    const p = PACKS[i];
+    if (!p) return;
+    openModal(`
+      <h3>${esc(t('pay_title'))}</h3>
+      <div class="kv"><span>${esc(t('pay_pack'))}</span><strong>+${p.credits} ★</strong></div>
+      <div class="kv"><span>${esc(t('pay_price'))}</span><strong style="color:var(--accent);">${p.stars} ★ Telegram Stars</strong></div>
+      <p>${esc(t('pay_note'))}</p>
+      <button class="btn" id="payStarsBtn" onclick="payWithTelegramStars(${i})">${esc(t('pay_stars_btn', { s: p.stars }))}</button>
+      <button class="btn ghost" onclick="doDemoPay(${i})">${esc(t('pay_demo_btn'))}</button>
+      <button class="btn ghost" onclick="closeModal()">${esc(t('cancel'))}</button>
+    `);
+  }
+
+  async function payWithTelegramStars(i) {
+    const p = PACKS[i];
+    if (!p) return;
+    const btn = document.getElementById('payStarsBtn');
+    if (btn) { btn.disabled = true; btn.textContent = t('processing'); }
+
+    try {
+      const resp = await fetch('/api/create-stars-invoice', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          pack_id: p.id,
+          user_id: (tgUser && tgUser.id) ? tgUser.id : 0,
+          lang: S.lang
+        })
+      });
+      const data = await resp.json();
+      if (!resp.ok || !data.invoice_link) {
+        throw new Error(data.detail || 'Could not create Stars invoice');
+      }
+
+      if (tg && tg.openInvoice) {
+        tg.openInvoice(data.invoice_link, function(status) {
+          if (status === 'paid') {
+            creditUserBalance(p.credits);
+          } else if (btn) {
+            btn.disabled = false;
+            btn.textContent = t('pay_stars_btn', { s: p.stars });
+          }
+        });
+      } else {
+        window.open(data.invoice_link, '_blank');
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = t('pay_stars_btn', { s: p.stars });
+        }
+      }
+    } catch (e) {
+      showToast(e.message || 'Ошибка создания инвойса');
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = t('pay_stars_btn', { s: p.stars });
+      }
+    }
+  }
+
+  function doDemoPay(i) {
+    const p = PACKS[i];
+    if (!p) return;
+    creditUserBalance(p.credits);
+  }
+
+  function creditUserBalance(credits) {
+    S.balance += credits;
+    addTx('topup', credits);
+    saveState();
+    updateBalanceUI();
+    renderCabinet();
+    closeModal();
+    showToast(t('pay_done', { n: credits }));
+    haptic('success');
+  }
+
+  function openNoFunds(needed) {
+    openModal(`
+      <h3>${esc(t('nofunds_title'))}</h3>
+      <p>${esc(t('nofunds_text', { n: needed || COST }))}</p>
+      <button class="btn" onclick="closeModal(); showView('cabinet'); setTimeout(scrollToTopup, 80);">${esc(t('topup'))}</button>
+      <button class="btn ghost" onclick="closeModal()">${esc(t('cancel'))}</button>
+    `);
+  }
+
+  function applyPromo() {
+    const inp = document.getElementById('promoInp');
+    const code = (inp.value || '').trim().toUpperCase();
+    if (!code) return;
+
+    if (code === 'DEVMODE' || code === 'DEVELOPER') {
+      inp.value = '';
+      toggleDevMode(true);
+      renderCabinet();
+      return;
+    }
+
+    if (S.promoUsed) { showToast(t('promo_used')); haptic('error'); return; }
+    const bonus = PROMO_CODES[code];
+    if (!bonus) { showToast(t('promo_bad')); haptic('error'); return; }
+    S.promoUsed = true;
+    S.balance += bonus;
+    addTx('promo', bonus);
+    saveState();
+    updateBalanceUI();
+    inp.value = '';
+    renderCabinet();
+    showToast(t('promo_ok', { n: bonus }));
+    haptic('success');
+  }
+
+  // ================= Cabinet Render =================
+  function renderCabinet() {
+    const name = tgUser ? ([tgUser.first_name, tgUser.last_name].filter(Boolean).join(' ') || tgUser.username || t('guest')) : t('guest');
+    const sub = tgUser ? (tgUser.username ? '@' + tgUser.username : 'ID ' + tgUser.id) : 'Telegram Mini App';
+    const initial = (name || '?').trim().charAt(0).toUpperCase() || '?';
+    const avatar = (tgUser && tgUser.photo_url)
+      ? `<div class="avatar"><img src="${esc(tgUser.photo_url)}" alt="" onerror="this.parentNode.textContent='${esc(initial)}'"></div>`
+      : `<div class="avatar">${esc(initial)}</div>`;
+    const roleTag = S.devMode
+      ? `<span class="tag" style="background:var(--accent); color:#000; font-weight:800; border:none;">⚡ OWNER // DEV MODE</span>`
+      : `<span class="tag">${esc(t('plan'))}</span>`;
+
+    document.getElementById('cabProfile').innerHTML = `
+      ${avatar}
+      <div style="min-width:0;">
+        <div style="font-weight:800; font-size:16px;">${esc(name)}</div>
+        <div style="color:var(--muted); font-size:12px; margin-top:2px;">${esc(sub)} · ${roleTag}</div>
+      </div>`;
+
+    updateBalanceUI();
+
+    document.getElementById('cabStats').innerHTML = `
+      <div class="stat"><div class="v">${S.gens}</div><div class="k">${esc(t('gens'))}</div></div>
+      <div class="stat"><div class="v">${S.spent} ★</div><div class="k">${esc(t('spent'))}</div></div>`;
+
+    document.getElementById('cabPacks').innerHTML = PACKS.map((p, i) => `
+      <button class="pack ${p.pop ? 'pop' : ''}" onclick="openPay(${i})">
+        ${p.pop ? `<span class="badge">${esc(t('popular'))}</span>` : ''}
+        <div class="pc">+${p.credits}</div>
+        <div class="pk">${esc(t('pack_credits'))}</div>
+        <div class="pp">★ ${p.stars} Stars</div>
+      </button>`).join('');
+
+    const hist = document.getElementById('cabHistory');
+    if (!S.history.length) {
+      hist.innerHTML = `<div class="empty">${esc(t('history_empty'))}</div>`;
+    } else {
+      hist.innerHTML = S.history.map((it, i) => `
+        <div class="list-item">
+          <div class="li-main">
+            <div class="li-title">${esc(it.title)}</div>
+            <div class="li-sub">${esc(fmtDate(it.ts))} · ${esc(it.query)}</div>
+          </div>
+          <div style="display:flex; gap:6px; flex-shrink:0;">
+            <button class="copy-btn" onclick="openHistory(${i})">${esc(t('open'))}</button>
+            <button class="copy-btn" onclick="delHistory(${i})">✕</button>
+          </div>
+        </div>`).join('');
+    }
+
+    const tx = document.getElementById('cabTx');
+    if (!S.tx.length) {
+      tx.innerHTML = `<div class="empty">${esc(t('tx_empty'))}</div>`;
+    } else {
+      tx.innerHTML = S.tx.slice(0, 15).map(x => `
+        <div class="list-item">
+          <div class="li-main">
+            <div class="li-title">${esc(t('tx_' + x.type))}</div>
+            <div class="li-sub">${esc(fmtDate(x.ts))}</div>
+          </div>
+          <div class="${x.amount >= 0 ? 'plus' : 'minus'}">${x.amount >= 0 ? '+' : ''}${x.amount} ★</div>
+        </div>`).join('');
+    }
+  }
+  function openHistory(i) {
+    const it = S.history[i];
+    if (!it) return;
+    lastResult = it.data;
+    renderResult(it.data);
+    showView('studio');
+    const res = document.getElementById('results');
+    res.style.display = 'block';
+    setTimeout(() => res.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
+  }
+  function delHistory(i) {
+    S.history.splice(i, 1);
+    saveState();
+    renderCabinet();
+  }
+  function clearHistory() {
+    S.history = [];
+    saveState();
+    renderCabinet();
+    showToast(t('cleared'));
+  }
+
+  // ================= Generation Pipeline =================
+  function showErr(msg) {
+    const b = document.getElementById('errBox');
+    b.textContent = msg;
+    b.style.display = 'block';
+    haptic('error');
+  }
+  function hideErr() { document.getElementById('errBox').style.display = 'none'; }
+
+  async function postJsonWithRetry(url, body, signal) {
+    const doFetch = () => fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: signal
+    });
+    try {
+      return await doFetch();
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e;
+      await new Promise(r => setTimeout(r, 3500));
+      return await doFetch();
+    }
+  }
+
+  async function startGeneration() {
+    hideErr();
+    const q = document.getElementById('queryInp').value.trim();
+    if (!q) { showErr(t('err_query')); return; }
+    if (!S.devMode && S.balance < COST) { openNoFunds(COST); return; }
+
+    const btn = document.getElementById('submitBtn');
+    const res = document.getElementById('results');
+
+    btn.disabled = true;
+    res.style.display = 'none';
+    startAiTerminal(q);
+
+    const ctrl = new AbortController();
+    const abortTimer = setTimeout(() => ctrl.abort(), 120000);
+
+    try {
+      const resp = await postJsonWithRetry('/api/analyze', { query: q, format_type: curFmt, tone: curTone, lang: S.lang }, ctrl.signal);
+      let payload = {};
+      try { payload = await resp.json(); } catch (e) {}
+      if (!resp.ok) throw new Error(payload.detail || t('err_generic'));
+
+      if (!S.devMode) {
+        S.balance -= COST;
+        S.spent += COST;
+        addTx('gen', -COST);
+      }
+      S.gens += 1;
+      S.history.unshift({
+        id: Date.now(),
+        ts: Date.now(),
+        title: payload.product_title || q.slice(0, 40),
+        query: q.slice(0, 60),
+        data: payload
+      });
+      S.history = S.history.slice(0, 15);
+      saveState();
+      updateBalanceUI();
+
+      lastResult = payload;
+      renderResult(payload);
+      res.style.display = 'block';
+      if (payload.meta_image) loadWatermarkProductImage(payload.meta_image);
+      haptic('success');
+      setTimeout(() => res.scrollIntoView({ behavior: 'smooth', block: 'start' }), 80);
+    } catch (e) {
+      if (e && e.name === 'AbortError') showErr(t('err_timeout'));
+      else showErr((e && e.message) || t('err_generic'));
+    } finally {
+      clearTimeout(abortTimer);
+      stopAiTerminal();
+      btn.disabled = false;
+    }
+  }
+
+  async function generateStandaloneTgPosts() {
+    const q = document.getElementById('tgQueryInp').value.trim();
+    if (!q) { showToast(t('err_query')); haptic('error'); return; }
+    if (!S.devMode && S.balance < TG_COST) { openNoFunds(TG_COST); return; }
+
+    const btn = document.getElementById('tgGenBtn');
+    const out = document.getElementById('tgPostsOutput');
+    btn.disabled = true;
+    out.innerHTML = `<div class="panel" style="text-align:center; color:var(--accent); font-family:var(--mono);">⚡ ПИШУ 3 РЕКЛАМНЫХ ПОСТА С МАРКИРОВКОЙ...</div>`;
+
+    try {
+      const resp = await postJsonWithRetry('/api/tg-post', { query: q, style: curTone, lang: S.lang });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || t('err_generic'));
+
+      if (!S.devMode) {
+        S.balance -= TG_COST;
+        S.spent += TG_COST;
+        addTx('tg', -TG_COST);
+      }
+      S.gens += 1;
+      saveState();
+      updateBalanceUI();
+
+      if (data.meta_image) loadWatermarkProductImage(data.meta_image);
+      out.innerHTML = renderTgPostsCards(data.tg_posts || []);
+      haptic('success');
+    } catch (e) {
+      out.innerHTML = `<div class="err-box" style="display:block;">${esc(e.message || t('err_generic'))}</div>`;
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function renderTgPostsCards(posts) {
+    const footer = getEridFooterText();
+    return posts.map((p, idx) => {
+      const fullPost = `${p.headline}\n\n${p.body}\n\n${p.cta}${footer ? '\n\n' + footer : ''}`;
+      const tpIdx = regTp(`${p.headline}.\n\n${p.body}\n\n${p.cta}`);
+      const cpIdx = reg(fullPost);
+      return `
+        <div class="card stagger-card" style="animation-delay:${idx * 0.07}s;">
+          <div class="card-top">
+            <div>
+              <span class="tag" style="color:var(--accent); border-color:var(--border-strong);">ПОСТ #0${idx + 1} · ${esc(p.style)}</span>
+            </div>
+            <div class="action-row">
+              <button class="prompter-btn" onclick="openTeleprompterIdx(${tpIdx})">${esc(t('prompter'))}</button>
+              <button class="copy-btn" onclick="copyIdx(${cpIdx})">${esc(t('copy'))}</button>
+            </div>
+          </div>
+          <div style="font-weight:800; font-size:14.5px; margin-bottom:6px;">${esc(p.headline)}</div>
+          <div class="tg-post-body">${esc(p.body)}</div>
+          <div style="font-weight:700; font-size:13px; color:var(--accent);">${esc(p.cta)}</div>
+          ${footer ? `<div class="erid-preview" style="display:block;">${esc(footer)}</div>` : ''}
+        </div>
+      `;
+    }).join('');
+  }
+
+  // ================= Render Studio Result (with AI Rewrite Bar) =================
+  function renderResult(d) {
+    copyStore.length = 0;
+    prompterStore.length = 0;
+
+    const imgHtml = d.meta_image ? `<img class="prod-thumb" src="${esc(d.meta_image)}" alt="" onerror="this.style.display='none'">` : '';
+    const price = d.meta_price ? `<span class="tag" style="color:var(--ok);">${esc(d.meta_price)}</span>` : '';
+    document.getElementById('pHeader').innerHTML = `
+      ${imgHtml}
+      <div style="min-width:0;">
+        <div style="font-weight:800; font-size:14.5px; margin-bottom:6px;">${esc(d.product_title)}</div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap;">
+          <span class="tag">${esc(d.meta_source || 'WEB')}</span>
+          <span class="tag">${esc(d.category || '')}</span>
+          ${price}
+        </div>
+      </div>`;
+
+    // 1. Scripts + Teleprompter + Quick AI Rewrite Toolbar
+    document.getElementById('tab-scripts').innerHTML = (d.scripts || []).map((sc, i) => {
+      const full = `${t('script')}: ${sc.title}\n${t('hook')}: ${sc.hook}\n` +
+        (sc.scenes || []).map(s => `[${s.timecode}] ${s.visual} | ${t('voice')}: ${s.voiceover}`).join('\n') +
+        `\nCTA: ${sc.cta}`;
+
+      const teleprompterVoiceText = [
+        sc.hook,
+        ...(sc.scenes || []).map(s => s.voiceover),
+        sc.cta
+      ].filter(Boolean).join('\n\n');
+
+      const tpIdx = regTp(teleprompterVoiceText);
+      const cpAllIdx = reg(full);
+
+      const scenes = (sc.scenes || []).map(s => `
+        <div class="scene-item">
+          <div class="mono" style="color:var(--accent); font-size:10.5px; margin-bottom:4px;">⏱ ${esc(s.timecode)}</div>
+          <div><strong>${esc(t('frame'))}:</strong> ${esc(s.visual)}</div>
+          <div style="margin:4px 0; color:#fff;"><strong>${esc(t('voice'))}:</strong> «${esc(s.voiceover)}»</div>
+          <div><strong>${esc(t('screen_text'))}:</strong> ${esc(s.on_screen_text)}</div>
+          <div class="prompt-box mono">
+            <span>🎥 AI: ${esc(s.ai_video_prompt)}</span>
+            <button class="copy-btn" onclick="copyIdx(${reg(s.ai_video_prompt)})">${esc(t('copy'))}</button>
+          </div>
+        </div>`).join('');
+
+      return `
+        <div class="card stagger-card" style="animation-delay:${i * 0.08}s;">
+          <div class="card-top">
+            <div style="min-width:0;">
+              <div style="font-weight:800; text-transform:uppercase;">0${i + 1} // ${esc(sc.title)}</div>
+              <div class="mono" style="font-size:10px; color:var(--muted);">${esc(sc.angle)} · <span style="color:var(--accent);">${esc(sc.virality_score)}% ${esc(t('virality'))}</span></div>
+            </div>
+            <div class="action-row">
+              <button class="prompter-btn" onclick="openTeleprompterIdx(${tpIdx})">${esc(t('prompter'))}</button>
+              <button class="copy-btn" onclick="copyIdx(${cpAllIdx})">${esc(t('copy_all'))}</button>
+            </div>
+          </div>
+          <div class="hook-box"><strong>${esc(t('hook'))}:</strong> «${esc(sc.hook)}»</div>
+          ${scenes}
+          <div style="font-size:12.5px; margin-top:8px;"><strong>CTA:</strong> ${esc(sc.cta)}</div>
+
+          <!-- QUICK AI REWRITE TOOLBAR -->
+          <div class="rewrite-bar">
+            <div class="rewrite-lbl">
+              <span>${esc(t('rw_title'))}</span>
+            </div>
+            <div class="rewrite-chips">
+              <button class="rw-chip" onclick="runScriptRewrite(${i}, 'shorter')">${esc(t('rw_shorter'))}</button>
+              <button class="rw-chip" onclick="runScriptRewrite(${i}, 'longer')">${esc(t('rw_longer'))}</button>
+              <button class="rw-chip" onclick="runScriptRewrite(${i}, 'bolder')">${esc(t('rw_bolder'))}</button>
+              <button class="rw-chip" onclick="runScriptRewrite(${i}, 'native')">${esc(t('rw_native'))}</button>
+              <button class="rw-chip" onclick="runScriptRewrite(${i}, 'funny')">${esc(t('rw_funny'))}</button>
+              <button class="rw-chip" onclick="toggleCustomRewriteBox(${i})">${esc(t('rw_custom'))}</button>
+            </div>
+            <div id="rwCustomBox-${i}" class="rw-custom-box">
+              <input id="rwCustomInp-${i}" class="inp" placeholder="${esc(t('rw_ph'))}">
+              <button class="btn small" onclick="runScriptRewrite(${i}, 'custom')">${esc(t('rw_go'))}</button>
+            </div>
+            <div id="rwStatus-${i}" class="mono" style="display:none; font-size:11px; color:var(--accent); margin-top:8px;"></div>
+          </div>
+        </div>`;
+    }).join('');
+
+    // 2. TG Ad Posts inside Studio
+    const tgPosts = d.tg_posts || [];
+    document.getElementById('tab-tgposts').innerHTML = tgPosts.length
+      ? renderTgPostsCards(tgPosts)
+      : `<div class="card"><div class="empty">Перейди во вкладку «TG Посты & ERID» снизу для генерации постов с маркировкой.</div></div>`;
+
+    // 3. Hooks
+    document.getElementById('tab-hooks').innerHTML = `
+      <div class="card stagger-card">
+        ${(d.viral_hooks || []).map((hk, i) => {
+          const hTpIdx = regTp(hk);
+          return `
+          <div class="list-item">
+            <div style="font-size:13px;"><strong>#0${i + 1}</strong> «${esc(hk)}»</div>
+            <div class="action-row">
+              <button class="prompter-btn" onclick="openTeleprompterIdx(${hTpIdx})">🎬</button>
+              <button class="copy-btn" onclick="copyIdx(${reg(hk)})">${esc(t('copy'))}</button>
+            </div>
+          </div>`;
+        }).join('')}
+      </div>`;
+
+    // 4. AI video prompts
+    document.getElementById('tab-prompts').innerHTML = `
+      <div class="card stagger-card">
+        ${(d.video_generator_prompts || []).map(p => `
+          <div class="prompt-box mono" style="margin-bottom:8px;">
+            <span>${esc(p)}</span>
+            <button class="copy-btn" onclick="copyIdx(${reg(p)})">${esc(t('copy'))}</button>
+          </div>`).join('')}
+      </div>`;
+
+    // 5. Audience & SEO
+    const ht = (d.hashtags || []).join(' ');
+    const seoFull = `${d.seo_caption || ''}\n\n${ht}`;
+    const pains = (d.pain_points || []).map(x => `<li>${esc(x)}</li>`).join('');
+    const feats = (d.killer_features || []).map(x => `<li>${esc(x)}</li>`).join('');
+    document.getElementById('tab-seo').innerHTML = `
+      <div class="card stagger-card">
+        <div class="card-top"><strong>${esc(t('audience'))}</strong></div>
+        <div style="font-size:13px;">${esc(d.target_audience)}</div>
+      </div>
+      ${pains ? `<div class="card stagger-card"><div class="card-top"><strong>${esc(t('pains'))}</strong></div><ul style="font-size:13px; padding-left:18px;">${pains}</ul></div>` : ''}
+      ${feats ? `<div class="card stagger-card"><div class="card-top"><strong>${esc(t('features'))}</strong></div><ul style="font-size:13px; padding-left:18px;">${feats}</ul></div>` : ''}
+      <div class="card stagger-card">
+        <div class="card-top">
+          <strong>${esc(t('seo_title'))}</strong>
+          <button class="copy-btn" onclick="copyIdx(${reg(seoFull)})">${esc(t('copy_seo'))}</button>
+        </div>
+        <div style="font-size:13px; margin-bottom:8px; white-space:pre-line;">${esc(d.seo_caption)}</div>
+        <div class="mono" style="font-size:11px; color:var(--muted);">${esc(ht)}</div>
+      </div>`;
+  }
+
+  // ================= Init =================
+  updateBalanceUI();
+  applyLang();
+  drawWatermark();
+  fetch('/health').catch(() => {});
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_webapp():
+    html_out = FRONTEND_UI.replace("__ADMIN_TG_ID__", ADMIN_TG_ID)
+    return HTMLResponse(
+        content=html_out,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
