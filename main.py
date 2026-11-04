@@ -3,8 +3,8 @@ import re
 import json
 import asyncio
 import logging
+from html import escape as h
 from contextlib import asynccontextmanager
-from typing import List, Optional
 
 import httpx
 from bs4 import BeautifulSoup
@@ -28,17 +28,27 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 APP_URL = os.getenv("RENDER_EXTERNAL_URL", "https://sniper-ugc.onrender.com").strip()
 
+# Основная модель + запасные (через запятую). Можно менять в Render -> Environment
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+GEMINI_FALLBACK_MODELS = [
+    m.strip()
+    for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash").split(",")
+    if m.strip()
+]
+
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
 
 class AnalyzeRequest(BaseModel):
     query: str
     format_type: str = "ugc"
     tone: str = "native"
 
+
 # =====================================================================
-# БЕЗОПАСНЫЙ СБОРЩИК ДАННЫХ (WILDBERRIES / ССЫЛКИ / ТЕКСТ)
+# СБОРЩИК ДАННЫХ (WILDBERRIES / ССЫЛКИ / ТЕКСТ)
 # =====================================================================
 def get_wb_basket_host(vol: int) -> str:
     ranges = [
@@ -54,11 +64,42 @@ def get_wb_basket_host(vol: int) -> str:
     return "https://basket-25.wbbasket.ru"
 
 
+async def find_wb_card(vol: int, part: int, nm_id: int, client: httpx.AsyncClient):
+    """Возвращает (base_url, card_json) или (base_url_по_умолчанию, None)."""
+    path = f"/vol{vol}/part{part}/{nm_id}"
+    default_base = get_wb_basket_host(vol) + path
+
+    # 1. Пробуем вычисленную корзину
+    try:
+        r = await client.get(f"{default_base}/info/ru/card.json", timeout=5.0)
+        if r.status_code == 200:
+            return default_base, r.json()
+    except Exception as e:
+        logging.warning(f"WB primary basket failed: {e}")
+
+    # 2. Если не вышло — параллельно перебираем корзины 01..40
+    async def probe(num: int):
+        base = f"https://basket-{num:02d}.wbbasket.ru{path}"
+        try:
+            r = await client.get(f"{base}/info/ru/card.json", timeout=4.0)
+            if r.status_code == 200:
+                return base, r.json()
+        except Exception:
+            pass
+        return None
+
+    results = await asyncio.gather(*(probe(n) for n in range(1, 41)))
+    for res in results:
+        if res:
+            return res
+    return default_base, None
+
+
 async def parse_wildberries_safe(nm_id: int, client: httpx.AsyncClient) -> dict:
     vol = nm_id // 100000
     part = nm_id // 1000
-    host = get_wb_basket_host(vol)
-    base_url = f"{host}/vol{vol}/part{part}/{nm_id}"
+
+    base_url, card = await find_wb_card(vol, part, nm_id, client)
 
     info = {
         "source": "Wildberries",
@@ -71,17 +112,15 @@ async def parse_wildberries_safe(nm_id: int, client: httpx.AsyncClient) -> dict:
         "image": f"{base_url}/images/big/1.webp"
     }
 
-    try:
-        r_card = await client.get(f"{base_url}/info/ru/card.json", timeout=6.0)
-        if r_card.status_code == 200:
-            data = r_card.json()
-            info["title"] = data.get("imt_name") or info["title"]
-            info["brand"] = data.get("selling", {}).get("brand_name", "")
-            info["description"] = data.get("description", "")
-            opts = data.get("options", [])
+    if card:
+        try:
+            info["title"] = card.get("imt_name") or info["title"]
+            info["brand"] = (card.get("selling") or {}).get("brand_name", "")
+            info["description"] = card.get("description", "")
+            opts = card.get("options") or []
             info["features"] = [f"{o.get('name')}: {o.get('value')}" for o in opts[:10]]
-    except Exception as e:
-        logging.warning(f"WB card.json warning: {e}")
+        except Exception as e:
+            logging.warning(f"WB card parse warning: {e}")
 
     try:
         card_api = f"https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={nm_id}"
@@ -112,15 +151,15 @@ async def extract_product_data(raw_input: str) -> dict:
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8"
     }
 
-    # 1. Проверка Wildberries (по ссылке или по числовому артикулу)
+    # 1. Wildberries (ссылка или числовой артикул)
     wb_match = re.search(r"wildberries\.ru/catalog/(\d+)", raw)
     num_match = re.fullmatch(r"\d{6,12}", raw)
     if wb_match or num_match:
         nm_id = int(wb_match.group(1) if wb_match else raw)
-        async with httpx.AsyncClient(headers=headers, follow_redirects=True, verify=False) as client:
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
             return await parse_wildberries_safe(nm_id, client)
 
-    # 2. Проверка веб-ссылки (Ozon, Яндекс Маркет, лендинги, интернет-магазины)
+    # 2. Любая веб-ссылка
     url_match = re.search(r"(https?://[^\s]+)", raw)
     if url_match:
         url = url_match.group(1)
@@ -134,7 +173,7 @@ async def extract_product_data(raw_input: str) -> dict:
             "raw_text": f"Ссылка на товар: {url}\nПользовательский контекст: {raw}"
         }
         try:
-            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=8.0, verify=False) as client:
+            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=8.0) as client:
                 resp = await client.get(url)
                 if resp.status_code == 200:
                     soup = BeautifulSoup(resp.text, "html.parser")
@@ -160,7 +199,7 @@ async def extract_product_data(raw_input: str) -> dict:
             logging.warning(f"URL parsing skipped due to: {e}")
         return fallback_data
 
-    # 3. Прямой текстовый ввод
+    # 3. Текстовое описание
     return {
         "source": "Текст",
         "title": raw[:80],
@@ -173,25 +212,7 @@ async def extract_product_data(raw_input: str) -> dict:
 # =====================================================================
 # ГЕНЕРАЦИЯ UGC-ВОРОНКИ ЧЕРЕЗ GEMINI
 # =====================================================================
-async def generate_ugc_payload(data: dict, format_type: str, tone: str) -> dict:
-    if not ai_client:
-        raise ValueError("GEMINI_API_KEY не задан в переменных окружения на Render. Добавь его во вкладке Environment.")
-
-    format_labels = {
-        "ugc": "Нативный честный отзыв реального пользователя",
-        "problem_solution": "Острая боль ЦА -> Спасение с помощью товара",
-        "unboxing": "Быстрая распаковка / ASMR / Эффект первого впечатления",
-        "aesthetic": "Эстетика / TikTok Lifestyle / Минималистичный визуал",
-        "storytelling": "Жизненная история / Провокация / Неожиданный финал"
-    }
-    tone_labels = {
-        "native": "Разговорный, нативный, доверительный",
-        "aggressive": "Дерзкий, кликбейтный, высокий темп, жесткие триггеры",
-        "humor": "Ирония, легкий стеб, житейский юмор",
-        "luxury": "Дорогой, спокойный, акцент на статусе и качестве"
-    }
-
-    system_instruction = """
+SYSTEM_INSTRUCTION = """
 Ты — топ-продюсер вирального контента для TikTok, Reels и Shorts.
 Твоя задача — проанализировать товар/ссылку и сгенерировать готовую виральную воронку продвижения.
 Ты ВСЕГДА возвращаешь результат СТРОГО в виде валидного JSON без markdown-разметки (без ```json).
@@ -238,6 +259,53 @@ async def generate_ugc_payload(data: dict, format_type: str, tone: str) -> dict:
 }
 """
 
+
+def _parse_model_json(text: str) -> dict:
+    clean = (text or "").strip()
+    if not clean:
+        raise ValueError("Gemini вернул пустой ответ (возможно, сработал фильтр безопасности). Попробуй изменить запрос.")
+
+    if clean.startswith("```"):
+        clean = re.sub(r"^```(?:json)?\s*", "", clean)
+        clean = re.sub(r"\s*```$", "", clean)
+
+    try:
+        parsed = json.loads(clean)
+    except json.JSONDecodeError:
+        # пробуем вытащить первый JSON-объект из текста
+        m = re.search(r"\{.*\}", clean, re.DOTALL)
+        if not m:
+            raise ValueError("Модель вернула некорректный JSON. Попробуй ещё раз.")
+        try:
+            parsed = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            raise ValueError("Модель вернула некорректный JSON. Попробуй ещё раз.")
+
+    if isinstance(parsed, list):
+        parsed = next((x for x in parsed if isinstance(x, dict)), None)
+    if not isinstance(parsed, dict):
+        raise ValueError("Модель вернула неожиданный формат ответа.")
+    return parsed
+
+
+async def generate_ugc_payload(data: dict, format_type: str, tone: str) -> dict:
+    if not ai_client:
+        raise ValueError("GEMINI_API_KEY не задан в переменных окружения на Render. Добавь его во вкладке Environment.")
+
+    format_labels = {
+        "ugc": "Нативный честный отзыв реального пользователя",
+        "problem_solution": "Острая боль ЦА -> Спасение с помощью товара",
+        "unboxing": "Быстрая распаковка / ASMR / Эффект первого впечатления",
+        "aesthetic": "Эстетика / TikTok Lifestyle / Минималистичный визуал",
+        "storytelling": "Жизненная история / Провокация / Неожиданный финал"
+    }
+    tone_labels = {
+        "native": "Разговорный, нативный, доверительный",
+        "aggressive": "Дерзкий, кликбейтный, высокий темп, жесткие триггеры",
+        "humor": "Ирония, легкий стеб, житейский юмор",
+        "luxury": "Дорогой, спокойный, акцент на статусе и качестве"
+    }
+
     user_prompt = f"""
 ДАННЫЕ О ПРОДУКТЕ:
 {json.dumps(data, ensure_ascii=False, indent=2)}
@@ -248,24 +316,39 @@ async def generate_ugc_payload(data: dict, format_type: str, tone: str) -> dict:
 Сделай 3 детализированных сценария с раскадровкой, 5 хуков, 3 качественных промпта для ИИ-видео (Kling/Runway), выдели боли ЦА и SEO-описание.
 """
 
-    resp = await asyncio.to_thread(
-        ai_client.models.generate_content,
-        model="gemini-2.0-flash",
-        contents=user_prompt,
-        config=genai_types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            temperature=0.7,
-            response_mime_type="application/json"
-        )
+    config = genai_types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        temperature=0.7,
+        response_mime_type="application/json"
     )
 
-    clean_json = resp.text.strip()
-    if clean_json.startswith("```"):
-        clean_json = re.sub(r"^```json\s*", "", clean_json)
-        clean_json = re.sub(r"^```\s*", "", clean_json)
-        clean_json = re.sub(r"\s*```$", "", clean_json)
+    models_to_try = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
+    resp = None
+    last_error = None
 
-    parsed_result = json.loads(clean_json)
+    for model_name in models_to_try:
+        try:
+            resp = await asyncio.to_thread(
+                ai_client.models.generate_content,
+                model=model_name,
+                contents=user_prompt,
+                config=config
+            )
+            logging.info(f"Gemini model used: {model_name}")
+            break
+        except Exception as e:
+            last_error = e
+            msg = str(e)
+            # Если модель недоступна — пробуем следующую, иначе сразу падаем
+            if "NOT_FOUND" in msg or "404" in msg or "no longer available" in msg:
+                logging.warning(f"Model {model_name} unavailable, trying next. {msg[:200]}")
+                continue
+            raise
+
+    if resp is None:
+        raise ValueError(f"Ни одна модель Gemini не доступна. Последняя ошибка: {last_error}")
+
+    parsed_result = _parse_model_json(resp.text)
     parsed_result["meta_source"] = data.get("source", "Web")
     parsed_result["meta_image"] = data.get("image", "")
     parsed_result["meta_price"] = data.get("price", "")
@@ -289,6 +372,7 @@ async def bot_start(message: types.Message):
         parse_mode="HTML"
     )
 
+
 @dp.message()
 async def bot_quick_message(message: types.Message):
     txt = (message.text or "").strip()
@@ -298,23 +382,33 @@ async def bot_quick_message(message: types.Message):
     try:
         data = await extract_product_data(txt)
         res = await generate_ugc_payload(data, "ugc", "native")
-        s1 = res["scripts"][0]
-        hooks = "\n".join([f"• <i>«{h}»</i>" for h in res["viral_hooks"][:3]])
-        
+
+        scripts = res.get("scripts") or []
+        if not scripts:
+            raise ValueError("Модель не вернула сценарии, попробуй ещё раз")
+        s1 = scripts[0]
+
+        hooks = "\n".join(
+            f"• <i>«{h(str(x))}»</i>" for x in (res.get("viral_hooks") or [])[:3]
+        )
+
         reply = (
-            f"🎯 <b>{res['product_title']}</b>\n\n"
+            f"🎯 <b>{h(str(res.get('product_title', 'Товар')))}</b>\n\n"
             f"🔥 <b>ТОП-ХУКИ:</b>\n{hooks}\n\n"
-            f"🎬 <b>СЦЕНАРИЙ: {s1['title']} ({s1.get('virality_score', 95)}% виральность)</b>\n"
-            f"<b>Хук:</b> {s1['hook']}\n\n"
-            f"📢 <b>CTA:</b> {s1['cta']}"
+            f"🎬 <b>СЦЕНАРИЙ: {h(str(s1.get('title', '')))} ({h(str(s1.get('virality_score', 95)))}% виральность)</b>\n"
+            f"<b>Хук:</b> {h(str(s1.get('hook', '')))}\n\n"
+            f"📢 <b>CTA:</b> {h(str(s1.get('cta', '')))}"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⚡ Открыть полную раскадровку", web_app=WebAppInfo(url=APP_URL))]
         ])
         await wait_msg.edit_text(reply, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
-        logging.error(f"Telegram parse err: {e}")
-        await wait_msg.edit_text(f"⚠️ Ошибка: {e}")
+        logging.error(f"Telegram parse err: {e}", exc_info=True)
+        try:
+            await wait_msg.edit_text(f"⚠️ Ошибка: {h(str(e))[:3500]}", parse_mode="HTML")
+        except Exception:
+            pass
 
 
 # =====================================================================
@@ -333,14 +427,18 @@ async def lifespan(app: FastAPI):
     yield
     if task:
         task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
     if bot:
         await bot.session.close()
 
+
 app = FastAPI(title="SNIPER UGC", lifespan=lifespan)
+
 
 @app.head("/")
 async def head_ping():
     return HTMLResponse(content="", status_code=200)
+
 
 @app.post("/api/analyze")
 async def api_analyze_endpoint(req: AnalyzeRequest):
@@ -354,14 +452,15 @@ async def api_analyze_endpoint(req: AnalyzeRequest):
         logging.error(f"API Error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
 FRONTEND_UI = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>SNIPER // UGC</title>
-<script src="[https://telegram.org/js/telegram-web-app.js](https://telegram.org/js/telegram-web-app.js)"></script>
-<link href="[https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap](https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap)" rel="stylesheet">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root {
     --bg: #000000;
@@ -511,6 +610,7 @@ FRONTEND_UI = r"""<!DOCTYPE html>
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 8px;
     margin-bottom: 10px;
     padding-bottom: 6px;
     border-bottom: 1px solid var(--border);
@@ -523,6 +623,7 @@ FRONTEND_UI = r"""<!DOCTYPE html>
     border-radius: 4px;
     font-size: 10px;
     cursor: pointer;
+    flex-shrink: 0;
   }
   .copy-btn:active { background: #fff; color: #000; }
   .hook-box {
@@ -572,7 +673,7 @@ FRONTEND_UI = r"""<!DOCTYPE html>
 <body>
   <div class="header">
     <div class="brand"><div class="dot"></div><span>SNIPER // UGC</span></div>
-    <span class="tag mono">V2.0 STABLE</span>
+    <span class="tag mono">V2.1 STABLE</span>
   </div>
 
   <div class="panel">
@@ -623,7 +724,7 @@ FRONTEND_UI = r"""<!DOCTYPE html>
   <div id="toast" class="toast mono">СКОПИРОВАНО</div>
 
 <script>
-  const tg = window.Telegram?.WebApp;
+  const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
   if (tg) {
     tg.ready();
     tg.expand();
@@ -633,6 +734,14 @@ FRONTEND_UI = r"""<!DOCTYPE html>
 
   let curFmt = 'ugc';
   let curTone = 'native';
+
+  // Хранилище текстов для кнопок COPY (безопасно для любых кавычек)
+  const copyStore = [];
+  function reg(txt) {
+    copyStore.push(txt == null ? '' : String(txt));
+    return copyStore.length - 1;
+  }
+  function copyIdx(i) { copy(copyStore[i]); }
 
   function bindChips(id, cb) {
     document.querySelectorAll('#' + id + ' .chip').forEach(c => {
@@ -653,23 +762,47 @@ FRONTEND_UI = r"""<!DOCTYPE html>
     document.getElementById('tab-' + name).classList.add('active');
   }
 
-  function copy(txt) {
-    navigator.clipboard.writeText(txt);
+  function showToast() {
     const t = document.getElementById('toast');
     t.style.display = 'block';
-    if (tg?.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
+    if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
     setTimeout(() => t.style.display = 'none', 1200);
   }
 
+  function fallbackCopy(txt) {
+    const ta = document.createElement('textarea');
+    ta.value = txt;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+  }
+
+  function copy(txt) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(txt).catch(() => fallbackCopy(txt));
+    } else {
+      fallbackCopy(txt);
+    }
+    showToast();
+  }
+
   function esc(s) {
-    if (!s) return '';
-    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    if (s === null || s === undefined) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  }
+
+  function showError(msg) {
+    if (tg && tg.showAlert) tg.showAlert(msg);
+    else alert(msg);
   }
 
   async function startGeneration() {
     const q = document.getElementById('queryInp').value.trim();
     if (!q) {
-      alert('Укажи ссылку или артикул');
+      showError('Укажи ссылку или артикул');
       return;
     }
     const btn = document.getElementById('submitBtn');
@@ -687,15 +820,16 @@ FRONTEND_UI = r"""<!DOCTYPE html>
         body: JSON.stringify({ query: q, format_type: curFmt, tone: curTone })
       });
 
-      const payload = await resp.json();
+      let payload = {};
+      try { payload = await resp.json(); } catch (e) {}
       if (!resp.ok) {
         throw new Error(payload.detail || 'Не удалось обработать запрос');
       }
       render(payload);
       res.style.display = 'block';
-      if (tg?.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
+      if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
     } catch (e) {
-      alert('Ошибка: ' + e.message);
+      showError('Ошибка: ' + e.message);
     } finally {
       ldr.style.display = 'none';
       btn.disabled = false;
@@ -703,13 +837,15 @@ FRONTEND_UI = r"""<!DOCTYPE html>
   }
 
   function render(d) {
+    copyStore.length = 0;
+
     const imgHtml = d.meta_image ? `<img class="prod-thumb" src="${esc(d.meta_image)}" onerror="this.style.display='none'">` : '';
     const price = d.meta_price ? `<span class="tag mono">${esc(d.meta_price)}</span>` : '';
     document.getElementById('pHeader').innerHTML = `
       ${imgHtml}
       <div>
         <div style="font-weight:600; font-size:14px; margin-bottom:4px;">${esc(d.product_title)}</div>
-        <div style="display:flex; gap:6px;">
+        <div style="display:flex; gap:6px; flex-wrap:wrap;">
           <span class="tag mono">${esc(d.meta_source || 'WEB')}</span>
           <span class="tag mono">${esc(d.category || 'Товар')}</span>
           ${price}
@@ -719,7 +855,9 @@ FRONTEND_UI = r"""<!DOCTYPE html>
 
     // 1. Сценарии
     document.getElementById('tab-scripts').innerHTML = (d.scripts || []).map((sc, i) => {
-      const full = `Сценарий: ${sc.title}\nХук: ${sc.hook}\n` + (sc.scenes || []).map(s => `[${s.timecode}] ${s.visual} | Голос: ${s.voiceover}`).join('\n') + `\nCTA: ${sc.cta}`;
+      const full = `Сценарий: ${sc.title}\nХук: ${sc.hook}\n` +
+        (sc.scenes || []).map(s => `[${s.timecode}] ${s.visual} | Голос: ${s.voiceover}`).join('\n') +
+        `\nCTA: ${sc.cta}`;
       const scenes = (sc.scenes || []).map(s => `
         <div class="scene-item">
           <div class="mono" style="color:var(--text-muted); font-size:10px; margin-bottom:4px;">${esc(s.timecode)}</div>
@@ -728,7 +866,7 @@ FRONTEND_UI = r"""<!DOCTYPE html>
           <div><strong>Текст:</strong> ${esc(s.on_screen_text)}</div>
           <div class="prompt-box mono">
             <span>AI: ${esc(s.ai_video_prompt)}</span>
-            <button class="copy-btn" onclick='copy(${JSON.stringify(s.ai_video_prompt)})'>COPY</button>
+            <button class="copy-btn" onclick="copyIdx(${reg(s.ai_video_prompt)})">COPY</button>
           </div>
         </div>
       `).join('');
@@ -738,9 +876,9 @@ FRONTEND_UI = r"""<!DOCTYPE html>
           <div class="card-top">
             <div>
               <div style="font-weight:700; text-transform:uppercase;">0${i+1} // ${esc(sc.title)}</div>
-              <div class="mono" style="font-size:10px; color:var(--text-muted);">${esc(sc.angle)} · ${sc.virality_score}% VIRALITY</div>
+              <div class="mono" style="font-size:10px; color:var(--text-muted);">${esc(sc.angle)} · ${esc(sc.virality_score)}% VIRALITY</div>
             </div>
-            <button class="copy-btn mono" onclick='copy(${JSON.stringify(full)})'>ВЕСЬ СЦЕНАРИЙ</button>
+            <button class="copy-btn mono" onclick="copyIdx(${reg(full)})">ВЕСЬ СЦЕНАРИЙ</button>
           </div>
           <div class="hook-box"><strong>ХУК:</strong> «${esc(sc.hook)}»</div>
           ${scenes}
@@ -752,10 +890,10 @@ FRONTEND_UI = r"""<!DOCTYPE html>
     // 2. Хуки
     document.getElementById('tab-hooks').innerHTML = `
       <div class="card">
-        ${(d.viral_hooks || []).map((h, i) => `
-          <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid var(--border);">
-            <div style="font-size:13px;"><strong>#0${i+1}</strong> «${esc(h)}»</div>
-            <button class="copy-btn mono" onclick='copy(${JSON.stringify(h)})'>COPY</button>
+        ${(d.viral_hooks || []).map((hk, i) => `
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding:8px 0; border-bottom:1px solid var(--border);">
+            <div style="font-size:13px;"><strong>#0${i+1}</strong> «${esc(hk)}»</div>
+            <button class="copy-btn mono" onclick="copyIdx(${reg(hk)})">COPY</button>
           </div>
         `).join('')}
       </div>
@@ -764,10 +902,10 @@ FRONTEND_UI = r"""<!DOCTYPE html>
     // 3. AI Видео
     document.getElementById('tab-prompts').innerHTML = `
       <div class="card">
-        ${(d.video_generator_prompts || []).map((p, i) => `
+        ${(d.video_generator_prompts || []).map(p => `
           <div class="prompt-box mono" style="margin-bottom:8px;">
             <span>${esc(p)}</span>
-            <button class="copy-btn" onclick='copy(${JSON.stringify(p)})'>COPY</button>
+            <button class="copy-btn" onclick="copyIdx(${reg(p)})">COPY</button>
           </div>
         `).join('')}
       </div>
@@ -775,16 +913,26 @@ FRONTEND_UI = r"""<!DOCTYPE html>
 
     // 4. ЦА & SEO
     const ht = (d.hashtags || []).join(' ');
-    const seoFull = `${d.seo_caption}\n\n${ht}`;
+    const seoFull = `${d.seo_caption || ''}\n\n${ht}`;
+    const pains = (d.pain_points || []).map(x => `<li>${esc(x)}</li>`).join('');
+    const feats = (d.killer_features || []).map(x => `<li>${esc(x)}</li>`).join('');
     document.getElementById('tab-seo').innerHTML = `
       <div class="card">
         <div class="card-top"><strong>ЦЕЛЕВАЯ АУДИТОРИЯ</strong></div>
         <div style="font-size:13px;">${esc(d.target_audience)}</div>
       </div>
+      ${pains ? `<div class="card">
+        <div class="card-top"><strong>БОЛИ ЦА</strong></div>
+        <ul style="font-size:13px; padding-left:18px;">${pains}</ul>
+      </div>` : ''}
+      ${feats ? `<div class="card">
+        <div class="card-top"><strong>ГЛАВНЫЕ ФИШКИ</strong></div>
+        <ul style="font-size:13px; padding-left:18px;">${feats}</ul>
+      </div>` : ''}
       <div class="card">
         <div class="card-top">
           <strong>SEO ОПИСАНИЕ И ТЕГИ</strong>
-          <button class="copy-btn mono" onclick='copy(${JSON.stringify(seoFull)})'>COPY SEO</button>
+          <button class="copy-btn mono" onclick="copyIdx(${reg(seoFull)})">COPY SEO</button>
         </div>
         <div style="font-size:13px; margin-bottom:8px; white-space:pre-line;">${esc(d.seo_caption)}</div>
         <div class="mono" style="font-size:11px; color:var(--text-muted);">${esc(ht)}</div>
@@ -795,6 +943,7 @@ FRONTEND_UI = r"""<!DOCTYPE html>
 </body>
 </html>
 """
+
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_webapp():
